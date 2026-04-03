@@ -1,0 +1,23 @@
+## .NET / C# ##
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.rsuser
+*.userosscache
+
+## Build outputs ##
+*.dll
+*.exe
+*.pdb
+*.cache
+*.nupkg
+
+## Logs generated at runtime ##
+fits_trace.log
+trace.log
+
+## OS ##
+Thumbs.db
+Desktop.ini
