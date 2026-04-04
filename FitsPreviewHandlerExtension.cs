@@ -3,6 +3,7 @@ using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace FitsPreviewHandler
 {
@@ -60,17 +61,29 @@ namespace FitsPreviewHandler
         private RECT _bounds;
         private FitsPreviewControl _control;
         private System.Threading.Thread _uiThread;
+        private bool _isTempFile = false;
         
         // Shared log writer — delegates to the same path used by FitsPreviewControl
         private static void Log(string msg)
         {
+            msg = $"[{DateTime.Now:HH:mm:ss.fff}] [Extension] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {msg}";
+            System.Diagnostics.Debug.WriteLine(msg);
             try
             {
-                File.AppendAllText(
-                    FitsPreviewControl.LogPath,
-                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [Extension] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {msg}\n");
+                File.AppendAllText(FitsPreviewControl.LogPath, msg + "\n");
             }
-            catch { /* never crash because of logging */ }
+            catch { /* fallback only */ }
+        }
+
+        static FitsPreviewHandlerExtension()
+        {
+            // The earliest possible trace point in the .NET runtime
+            Log("--- STATIC CONSTRUCTOR INVOKED (Class loaded into AppDomain) ---");
+            Log($"  Domain: {AppDomain.CurrentDomain.FriendlyName}");
+            
+            AppDomain.CurrentDomain.UnhandledException += (s, e) => {
+                Log("!!! UNHANDLED EXCEPTION in AppDomain: " + e.ExceptionObject);
+            };
         }
 
         public FitsPreviewHandlerExtension()
@@ -93,8 +106,14 @@ namespace FitsPreviewHandler
             {
                 if (pstream is System.Runtime.InteropServices.ComTypes.IStream stream)
                 {
-                    string tempPath = Path.Combine(Path.GetTempPath(), "fitspreview_" + Guid.NewGuid() + ".fits");
+                    // Use the same LocalLow anchor for the temp fits to ensure write permissions
+                    string userProfile = Environment.GetEnvironmentVariable("USERPROFILE");
+                    string baseDir = Path.Combine(userProfile, "AppData", "LocalLow", "FitsPreviewHandler");
+                    if (!Directory.Exists(baseDir)) Directory.CreateDirectory(baseDir);
+
+                    string tempPath = Path.Combine(baseDir, "fitspreview_" + Guid.NewGuid() + ".fits");
                     Log($"  Writing stream to temp file: {tempPath}");
+                    
                     using (var fs = File.OpenWrite(tempPath))
                     {
                         byte[] buffer = new byte[65536];
@@ -116,6 +135,7 @@ namespace FitsPreviewHandler
                         finally { Marshal.FreeCoTaskMem(readPtr); }
                     }
                     _filePath = tempPath;
+                    _isTempFile = true;
                     Log($"  Temp file written OK: {_filePath}");
                 }
                 else
@@ -329,6 +349,20 @@ namespace FitsPreviewHandler
                 Log("Unload — control was null or handle not created");
             }
             _uiThread = null;
+            Log("Unload — cleaning up temp data");
+            if (_isTempFile && !string.IsNullOrEmpty(_filePath))
+            {
+                try
+                {
+                    if (File.Exists(_filePath))
+                    {
+                        File.Delete(_filePath);
+                        Log($"Unload — Deleted temp file: {_filePath}");
+                    }
+                }
+                catch (Exception ex) { Log("Unload — Could not delete temp file: " + ex.Message); }
+                _isTempFile = false;
+            }
             Log("Unload — done");
         }
 
@@ -351,5 +385,89 @@ namespace FitsPreviewHandler
         private object _site;
         public void SetSite(object pUnkSite) { _site = pUnkSite; }
         public void GetSite(ref Guid riid, out object ppvSite) { ppvSite = _site; }
+
+        #region Registration Logic
+
+        [ComRegisterFunction]
+        public static void Register(Type t)
+        {
+            try
+            {
+                string guid = t.GUID.ToString("B").ToUpper();
+                // Standard Microsoft AppID for Preview Host (prevhost.exe)
+                string appid = "{6d2b5079-2f0b-48dd-ab7f-97cec514d30b}";
+                
+                Log($"--- Registering Preview Handler {guid} ---");
+
+                // 1. .fits -> PerceivedType = image
+                using (RegistryKey key = Registry.ClassesRoot.CreateSubKey(".fits"))
+                {
+                    key.SetValue("PerceivedType", "image");
+                }
+
+                // 2. .fits -> ShellEx -> {8895b1c6-b41f-4c1c-a562-0d564250836f} = our CLSID
+                using (RegistryKey key = Registry.ClassesRoot.CreateSubKey(".fits\\ShellEx\\{8895b1c6-b41f-4c1c-a562-0d564250836f}"))
+                {
+                    key.SetValue("", guid);
+                }
+
+                // 3. Register in the official Preview Handlers list
+                using (RegistryKey key = Registry.LocalMachine.CreateSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PreviewHandlers"))
+                {
+                    key.SetValue(guid, "Fits Preview Handler");
+                }
+
+                // 4. Set AppID for our CLSID (referencing the standard System surrogate)
+                using (RegistryKey key = Registry.ClassesRoot.CreateSubKey("CLSID\\" + guid))
+                {
+                    key.SetValue("AppID", appid);
+                }
+
+                // NOTE: We no longer need to manually set InprocServer32/CodeBase 
+                // because regasm /codebase handles it when used correctly.
+                
+                Log("  Registration complete OK");
+            }
+            catch (Exception ex)
+            {
+                Log("  ERROR during registration: " + ex);
+                throw; 
+            }
+        }
+
+        [ComUnregisterFunction]
+        public static void Unregister(Type t)
+        {
+            try
+            {
+                string guid = t.GUID.ToString("B").ToUpper();
+                Log($"--- Unregistering Preview Handler {guid} ---");
+
+                // Remove .fits association
+                Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{8895b1c6-b41f-4c1c-a562-0d564250836f}", false);
+
+                // Remove from PreviewHandlers list
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PreviewHandlers", true))
+                {
+                    if (key != null) key.DeleteValue(guid, false);
+                }
+
+                // Clean up AppID reference (optional, regasm /u cleans most CLSID keys)
+                using (RegistryKey key = Registry.ClassesRoot.OpenSubKey("CLSID\\" + guid, true))
+                {
+                    if (key != null) {
+                        key.DeleteValue("AppID", false);
+                    }
+                }
+
+                Log("  Unregistration complete OK");
+            }
+            catch (Exception ex)
+            {
+                Log("  ERROR during unregistration: " + ex);
+            }
+        }
+
+        #endregion
     }
 }

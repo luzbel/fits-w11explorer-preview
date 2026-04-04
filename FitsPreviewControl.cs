@@ -37,21 +37,34 @@ namespace FitsPreviewHandler
     public class FitsPreviewControl : UserControl
     {
         // ── Shared log (same file as FitsPreviewHandlerExtension) ───────
-        internal static readonly string LogPath =
-            Path.Combine(
-                Path.GetDirectoryName(
-                    System.Reflection.Assembly.GetExecutingAssembly().Location) ?? @"C:\Temp",
-                "fits_trace.log");
+        public static string LogPath;
 
-        internal static void Log(string msg)
+        static FitsPreviewControl()
         {
             try
             {
-                File.AppendAllText(LogPath,
-                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] " +
-                    $"[Control] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {msg}\n");
+                // LocalLow is the designated spot for low-integrity processes (prevhost)
+                string userProfile = Environment.GetEnvironmentVariable("USERPROFILE");
+                string logDir = Path.Combine(userProfile, "AppData", "LocalLow", "FitsPreviewHandler");
+                if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir);
+                LogPath = Path.Combine(logDir, "fits_trace.log");
             }
-            catch { }
+            catch
+            {
+                // Last ditch effort: root of local temp
+                LogPath = Path.Combine(Path.GetTempPath(), "fits_trace.log");
+            }
+        }
+
+        internal static void Log(string msg)
+        {
+            msg = $"[{DateTime.Now:HH:mm:ss.fff}] [UI] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {msg}";
+            System.Diagnostics.Debug.WriteLine(msg);
+            try
+            {
+                File.AppendAllText(LogPath, msg + "\n");
+            }
+            catch { /* fallback only */ }
         }
 
         // ── Controls ────────────────────────────────────────────────────
