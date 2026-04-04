@@ -97,16 +97,23 @@ namespace FitsPreviewHandler
                     Log($"  Writing stream to temp file: {tempPath}");
                     using (var fs = File.OpenWrite(tempPath))
                     {
-                        byte[] buffer = new byte[512000]; // 500 KB — enough for any FITS header
-                        IntPtr bytesReadPtr = Marshal.AllocCoTaskMem(Marshal.SizeOf(typeof(int)));
+                        byte[] buffer = new byte[65536];
+                        long totalRead = 0;
+                        IntPtr readPtr = Marshal.AllocCoTaskMem(sizeof(int));
                         try
                         {
-                            stream.Read(buffer, buffer.Length, bytesReadPtr);
-                            int bytesRead = Marshal.ReadInt32(bytesReadPtr);
-                            Log($"  Stream read: {bytesRead} bytes");
-                            if (bytesRead > 0) fs.Write(buffer, 0, bytesRead);
+                            while (true)
+                            {
+                                stream.Read(buffer, buffer.Length, readPtr);
+                                int r = Marshal.ReadInt32(readPtr);
+                                if (r <= 0) break;
+                                fs.Write(buffer, 0, r);
+                                totalRead += r;
+                            }
+                            Log($"  Stream read complete: {totalRead} bytes");
+                            fs.Flush();
                         }
-                        finally { Marshal.FreeCoTaskMem(bytesReadPtr); }
+                        finally { Marshal.FreeCoTaskMem(readPtr); }
                     }
                     _filePath = tempPath;
                     Log($"  Temp file written OK: {_filePath}");
@@ -159,16 +166,17 @@ namespace FitsPreviewHandler
             _bounds = rect;
             if (_control != null && _control.IsHandleCreated)
             {
-                var r = new Rectangle(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+                var r = new Rectangle(0, 0, rect.right - rect.left, rect.bottom - rect.top);
+                Log($"SetRect — control READY (HWND: {_control.Handle:X}), resizing to {r}");
                 _control.BeginInvoke(new Action(() =>
                 {
-                    _control.Bounds = r;
-                    Log($"SetRect — control resized to {r}");
+                    try { _control.Bounds = r; }
+                    catch (Exception ex) { Log($"SetRect — EXCEPTION during resize: {ex.Message}"); }
                 }));
             }
             else
             {
-                Log("SetRect — control not ready yet, storing rect only");
+                Log($"SetRect — control not ready yet (_control={(_control == null ? "null" : "non-null")}, HandleCreated={_control?.IsHandleCreated ?? false})");
             }
         }
 
@@ -178,6 +186,9 @@ namespace FitsPreviewHandler
         [DllImport("user32.dll")]
         private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
             int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
 
         // WS_CHILD | WS_VISIBLE
         [DllImport("user32.dll", SetLastError = true)]
@@ -202,12 +213,24 @@ namespace FitsPreviewHandler
 
                 string pathToLoad = _filePath;
                 IntPtr parentHost = _parentHwnd;
+
+                // Robust bounds detection: if Explorer gave [0,0,0,0], ask parent directly
+                if (_bounds.right - _bounds.left <= 0 || _bounds.bottom - _bounds.top <= 0)
+                {
+                    Log("DoPreview — _bounds is empty! Getting client rect from parent.");
+                    if (GetClientRect(parentHost, out RECT parentRect))
+                    {
+                        _bounds = parentRect;
+                        Log($"DoPreview — GetClientRect(parent) → [{_bounds.left},{_bounds.top},{_bounds.right},{_bounds.bottom}]");
+                    }
+                }
+
                 Rectangle initialBounds = new Rectangle(
                     _bounds.left, _bounds.top,
                     _bounds.right - _bounds.left,
                     _bounds.bottom - _bounds.top);
 
-                Log($"DoPreview — initialBounds={initialBounds}");
+                Log($"DoPreview — final initialBounds={initialBounds}");
 
                 // Synchronization: wait until the control handle exists
                 var ready = new System.Threading.ManualResetEventSlim(false);
@@ -277,7 +300,8 @@ namespace FitsPreviewHandler
                 Log("DoPreview — UI thread started, waiting for handle (max 3 s)...");
 
                 bool signalled = ready.Wait(3000);
-                Log($"DoPreview — ready.Wait returned: signalled={signalled}");
+                Log($"DoPreview — ready.Wait returned: signalled={signalled} (HWND: {_control?.Handle:X})");
+                if (!signalled) Log("DoPreview — ERROR: UI thread did not signal handle creation in time.");
             }
             catch (Exception ex) { Log("DoPreview — EXCEPTION: " + ex); }
         }
