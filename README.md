@@ -15,6 +15,10 @@
   - **Debayering Inteligente**: Downsampling 2x2 (Binning) para sensores color sin artefactos de rejilla.
   - **Auto-Stretch Adaptativo**: Ajuste dinámico de niveles basado en Mediana/MAD para ver objetos débiles.
   - **Tintado por Filtro**: Colorea automáticamente tomas de banda estrecha (Ha, OIII, SII) según el header.
+- **Layout Dinámico**: Imagen arriba y tabla de datos abajo.
+  - **Altura Redimensionable**: Arrastra el divisor horizontal para dar más espacio a la imagen o a la tabla.
+  - **Scroll Independiente**: La tabla de metadatos mantiene su propio scrollbar para facilitar la navegación por headers extensos sin perder de vista la imagen.
+- **Streaming Progresivo**: Lee archivos de gigas sin bloquear la interfaz. Muestra el progreso de lectura centrado sobre la imagen mientras se procesa el flujo de datos.
 - **Tabla de Metadatos**: Muestra todos los keywords, valores y comentarios del header FITS.
   - 🟡 **Amarillo**: `NAXIS*` (Dimensiones).
   - 🟢 **Verde**: `COMMENT` / `HISTORY`.

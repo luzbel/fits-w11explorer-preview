@@ -73,7 +73,7 @@ namespace FitsPreviewHandler
         private SplitContainer _split;
         private DataGridView  _gridHeader;
         private PictureBox    _pictureBox;
-        private Label         _lblImageStatus;
+        private Label         _lblProgress;
         private TextBox       _txtError;
 
         // ── Concurrency ─────────────────────────────────────────────────
@@ -105,6 +105,7 @@ namespace FitsPreviewHandler
         {
             BackColor = Color.FromArgb(24, 24, 36);
             ForeColor = Color.FromArgb(220, 220, 235);
+            AutoScroll = false; // Disable global scrollbar to use inner panel scrolling instead
 
             // ── Title bar ────────────────────────────────────────────────
             _topPanel = new Panel
@@ -123,29 +124,56 @@ namespace FitsPreviewHandler
             };
             _topPanel.Controls.Add(_lblTitle);
 
-            // ── SplitContainer (left=grid, right=image) ──────────────────
+            // ── SplitContainer (Top=Image, Bottom=Grid) ──────────────────
             _split = new SplitContainer
             {
                 Dock = DockStyle.Fill,
-                Orientation = Orientation.Vertical,
-                SplitterDistance = 280,
+                Orientation = Orientation.Horizontal,
+                SplitterDistance = 350,
                 FixedPanel = FixedPanel.Panel1,
                 BorderStyle = BorderStyle.None,
-                Panel1MinSize = 100, Panel2MinSize = 50,
+                Panel1MinSize = 50, Panel2MinSize = 50,
                 BackColor = Color.FromArgb(24, 24, 36)
             };
             
-            // Set splitter distance safely
-            try { 
-                int d = Math.Min(280, Math.Max(100, Width / 2));
-                _split.SplitterDistance = d;
-            } catch { }
+            // Image Panel (Panel1)
+            _pictureBox = new PictureBox
+            {
+                Dock = DockStyle.Fill,
+                SizeMode = PictureBoxSizeMode.Zoom,
+                BackColor = Color.FromArgb(18, 18, 28)
+            };
 
-            // Grid
+            _lblProgress = new Label
+            {
+                AutoSize = true,
+                Text = "",
+                ForeColor = Color.FromArgb(180, 190, 220),
+                BackColor = Color.Transparent,
+                Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+            
+            // Handle centering of progress label
+            _split.Panel1.Resize += (s, e) => {
+                _lblProgress.Left = (_split.Panel1.Width - _lblProgress.Width) / 2;
+                _lblProgress.Top = (_split.Panel1.Height - _lblProgress.Height) / 2;
+            };
+            _lblProgress.SizeChanged += (s, e) => {
+                _lblProgress.Left = (_split.Panel1.Width - _lblProgress.Width) / 2;
+                _lblProgress.Top = (_split.Panel1.Height - _lblProgress.Height) / 2;
+            };
+
+            _split.Panel1.Controls.Add(_lblProgress);
+            _split.Panel1.Controls.Add(_pictureBox);
+
+            // Grid (Panel2)
             _gridHeader = new DataGridView
             {
                 Dock = DockStyle.Fill,
-                RowHeadersVisible = false, AllowUserToAddRows = false,
+                RowHeadersVisible = false, 
+                AllowUserToAddRows = false,
+                AllowUserToResizeRows = false,
                 ReadOnly = true,
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect,
                 MultiSelect = false,
@@ -153,6 +181,7 @@ namespace FitsPreviewHandler
                 BackgroundColor = Color.FromArgb(28, 28, 42),
                 GridColor = Color.FromArgb(50, 50, 70),
                 BorderStyle = BorderStyle.None,
+                ScrollBars = ScrollBars.Both, 
                 DefaultCellStyle = new DataGridViewCellStyle
                 {
                     BackColor = Color.FromArgb(28, 28, 42),
@@ -173,44 +202,25 @@ namespace FitsPreviewHandler
                 ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
                 ColumnHeadersHeight = 28,
                 RowTemplate = { Height = 22 },
-                ScrollBars = ScrollBars.Both,
                 CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal
             };
             _gridHeader.Columns.Add(new DataGridViewTextBoxColumn
-                { Name="Keyword", HeaderText="Keyword", Width=80, MinimumWidth=50, Resizable=DataGridViewTriState.True });
+                { Name="Keyword", HeaderText="Keyword", Width=100, MinimumWidth=50, Resizable=DataGridViewTriState.True });
             _gridHeader.Columns.Add(new DataGridViewTextBoxColumn
-                { Name="Value", HeaderText="Value", Width=110, MinimumWidth=60, Resizable=DataGridViewTriState.True });
+                { Name="Value", HeaderText="Value", Width=150, MinimumWidth=60, Resizable=DataGridViewTriState.True });
             _gridHeader.Columns.Add(new DataGridViewTextBoxColumn
                 { Name="Comment", HeaderText="Comment",
                   AutoSizeMode=DataGridViewAutoSizeColumnMode.Fill, MinimumWidth=60, Resizable=DataGridViewTriState.True });
-            _gridHeader.RowsAdded += (s, e) =>
-            {
+            
+            _gridHeader.RowsAdded += (s, e) => {
                 for (int i = e.RowIndex; i < e.RowIndex + e.RowCount && i < _gridHeader.Rows.Count; i++)
                     _gridHeader.Rows[i].DefaultCellStyle.BackColor =
                         (i % 2 == 0) ? Color.FromArgb(28, 28, 42) : Color.FromArgb(33, 33, 50);
             };
 
-            _split.Panel1.Controls.Add(_gridHeader);
+            _split.Panel2.Controls.Add(_gridHeader);
 
-            // PictureBox + status label
-            _pictureBox = new PictureBox
-            {
-                Dock = DockStyle.Fill,
-                SizeMode = PictureBoxSizeMode.Zoom,
-                BackColor = Color.FromArgb(18, 18, 28)
-            };
-            _lblImageStatus = new Label
-            {
-                Dock = DockStyle.Bottom, Height = 22, Text = "",
-                TextAlign = ContentAlignment.MiddleCenter,
-                ForeColor = Color.FromArgb(120, 130, 160),
-                BackColor = Color.FromArgb(28, 28, 42),
-                Font = new Font("Segoe UI", 8f)
-            };
-            _split.Panel2.Controls.Add(_pictureBox);
-            _split.Panel2.Controls.Add(_lblImageStatus);
-
-            // Error box (hidden)
+            // ── Error box (hidden) ──────────────────────────────────────
             _txtError = new TextBox
             {
                 Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, Visible = false,
@@ -307,7 +317,7 @@ namespace FitsPreviewHandler
 
             if (info.BitPix == 0)
             {
-                BeginInvoke(new Action(() => _lblImageStatus.Text = "⚠ BITPIX=0, cannot render"));
+                BeginInvoke(new Action(() => _lblProgress.Text = "⚠ BITPIX=0, cannot render"));
                 return;
             }
 
@@ -315,7 +325,7 @@ namespace FitsPreviewHandler
             long dataBytes = (long)info.Width * info.Height * info.Planes * info.BytesPerPixel;
             if (dataBytes > MAX_BYTES)
             {
-                BeginInvoke(new Action(() => _lblImageStatus.Text = $"⚠ Image too large ({dataBytes/1024/1024} MB)"));
+                BeginInvoke(new Action(() => _lblProgress.Text = $"⚠ Image too large ({dataBytes/1024/1024} MB)"));
                 return;
             }
 
@@ -323,29 +333,37 @@ namespace FitsPreviewHandler
             {
                 try
                 {
-                    Bitmap bmp = RenderImage(stream, info, token);
+                    void Report(string msg) => BeginInvoke(new Action(() => {
+                        _lblProgress.Text = msg;
+                        _lblProgress.Visible = true;
+                    }));
+
+                    Bitmap bmp = RenderImage(stream, info, token, Report);
                     if (bmp != null && !token.IsCancellationRequested)
                     {
                         BeginInvoke(new Action(() =>
                         {
                             _pictureBox.Image = bmp;
                             _pictureBox.Visible = true;
-                            _lblImageStatus.Visible = false;
+                            _lblProgress.Visible = false;
                         }));
                     }
                 }
                 catch (Exception ex)
                 {
                     Log("StartImageLoad — EXCEPTION: " + ex);
-                    BeginInvoke(new Action(() => _lblImageStatus.Text = "Render Error: " + ex.Message));
+                    BeginInvoke(new Action(() => {
+                        _lblProgress.Text = "Render Error: " + ex.Message;
+                        _lblProgress.Visible = true;
+                    }));
                 }
             }, token);
         }
 
         // ── Rendering pipeline ──────────────────────────────────────────
-        private static Bitmap RenderImage(Stream stream, ImageInfo info, System.Threading.CancellationToken token)
+        private static Bitmap RenderImage(Stream stream, ImageInfo info, System.Threading.CancellationToken token, Action<string> reportProgress = null)
         {
-            const int MAX_DIM = 1000;
+            const int MAX_DIM = 2000; // Increased max dim for better resolution in large layouts
             double aspect = (double)info.Width / info.Height;
             int outW, outH;
             if (info.Width >= info.Height)
@@ -356,7 +374,7 @@ namespace FitsPreviewHandler
             Log($"RenderImage — target {outW}×{outH}");
 
             // Read color/mono data
-            float[][] planes = ReadAllPlanes(stream, info, outW, outH, out int aW, out int aH, token);
+            float[][] planes = ReadAllPlanes(stream, info, outW, outH, out int aW, out int aH, token, reportProgress);
             if (token.IsCancellationRequested) return null;
             Log($"RenderImage — planes={planes.Length} actual={aW}×{aH}");
 
@@ -376,7 +394,8 @@ namespace FitsPreviewHandler
             Stream stream, ImageInfo info,
             int targetW, int targetH,
             out int actualW, out int actualH,
-            System.Threading.CancellationToken token)
+            System.Threading.CancellationToken token,
+            Action<string> reportProgress = null)
         {
             // If Bayer, we will produce 3 planes (RGB) directly during downsampling
             bool isBayer = !string.IsNullOrEmpty(info.BayerPattern) && info.Planes == 1;
@@ -411,6 +430,12 @@ namespace FitsPreviewHandler
                 for (int y = 0; y <= info.Height - (isBayer ? 2 : 1) && outY < actualH; y += sy)
                 {
                     if (token.IsCancellationRequested) break;
+
+                    if (y % (sy * 20) == 0) // Report progress every 20 output rows
+                    {
+                        double progress = 100.0 * (p * info.Height + y) / (info.Planes * info.Height);
+                        reportProgress?.Invoke($"Reading FITS data... {progress:F0}%");
+                    }
 
                     stream.Seek(planeOff + (long)y * rowBytes, SeekOrigin.Begin);
                     stream.Read(rowBuf, 0, (int)rowBytes);
@@ -792,9 +817,9 @@ namespace FitsPreviewHandler
             Log("ShowError — " + message.Replace("\r\n", " | ").Replace("\n", " | "));
             void Show()
             {
-                _split.Visible   = false;
-                _txtError.Visible = true;
-                _txtError.Text    = message;
+                _split.Visible      = false;
+                _txtError.Visible   = true;
+                _txtError.Text      = message;
             }
             if (InvokeRequired) BeginInvoke(new Action(Show)); else Show();
         }
