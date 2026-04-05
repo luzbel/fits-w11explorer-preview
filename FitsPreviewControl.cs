@@ -225,10 +225,10 @@ namespace FitsPreviewHandler
             Log("InitializeComponent — done");
         }
 
-        // ── Public entry point ──────────────────────────────────────────
+        // ── Public entry points ─────────────────────────────────────────
         public void LoadFits(string filePath)
         {
-            Log($"LoadFits — '{filePath}'");
+            Log($"LoadFits(string) — '{filePath}'");
             try
             {
                 if (!File.Exists(filePath))
@@ -237,33 +237,48 @@ namespace FitsPreviewHandler
                     ShowError($"File not found:\n{filePath}");
                     return;
                 }
-                Log($"LoadFits — size={new FileInfo(filePath).Length} bytes");
+                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    LoadFits(fs, Path.GetFileName(filePath));
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("LoadFits(string) — EXCEPTION: " + ex);
+                ShowError("Error opening FITS file:\r\n" + ex.Message);
+            }
+        }
 
-                var (rows, info) = ParseFitsFile(filePath);
+        public void LoadFits(Stream stream, string fileName)
+        {
+            Log($"LoadFits(Stream) — '{fileName}' length={stream.Length}");
+            try
+            {
+                var (rows, info) = ParseFitsStream(stream);
                 Log($"LoadFits — {rows.Count} keywords  image={info}");
 
-                Action populate = () => PopulateGrid(rows, filePath, info);
+                Action populate = () => PopulateGrid(rows, fileName, info);
                 if (InvokeRequired) Invoke(populate); else populate();
 
                 if (info.HasImage)
                 {
                     CancelOldLoad();
-                    StartImageLoad(filePath, info, _cts.Token);
+                    StartImageLoad(stream, info, _cts.Token);
                 }
                 else
                     Log("LoadFits — no image data");
             }
             catch (Exception ex)
             {
-                Log("LoadFits — EXCEPTION: " + ex);
-                ShowError("Error reading FITS:\r\n" + ex);
+                Log("LoadFits(Stream) — EXCEPTION: " + ex);
+                ShowError("Error reading FITS stream:\r\n" + ex.Message);
             }
         }
 
         // ── Grid population ─────────────────────────────────────────────
         private void PopulateGrid(
             List<(string kw, string val, string comment)> rows,
-            string filePath, ImageInfo info)
+            string fileName, ImageInfo info)
         {
             Log($"PopulateGrid — {rows.Count} rows");
             _gridHeader.Rows.Clear();
@@ -273,7 +288,7 @@ namespace FitsPreviewHandler
                   (info.Planes > 1 ? $"×{info.Planes}" : "") +
                   $"  BITPIX={info.BitPix}"
                 : " · no image";
-            _lblTitle.Text = Path.GetFileName(filePath) + imgNote;
+            _lblTitle.Text = fileName + imgNote;
 
             foreach (var (kw, val, comment) in rows)
             {
@@ -286,7 +301,7 @@ namespace FitsPreviewHandler
         }
 
         // ── Async image load ────────────────────────────────────────────
-        private void StartImageLoad(string filePath, ImageInfo info, System.Threading.CancellationToken token)
+        private void StartImageLoad(Stream stream, ImageInfo info, System.Threading.CancellationToken token)
         {
             Log($"StartImageLoad — {info.Width}×{info.Height} planes={info.Planes} bitpix={info.BitPix}");
 
@@ -300,54 +315,35 @@ namespace FitsPreviewHandler
             long dataBytes = (long)info.Width * info.Height * info.Planes * info.BytesPerPixel;
             if (dataBytes > MAX_BYTES)
             {
-                string msg = $"⚠ Image data too large ({dataBytes / 1024 / 1024} MB), skipped";
-                Log("StartImageLoad — " + msg);
-                BeginInvoke(new Action(() => _lblImageStatus.Text = msg));
+                BeginInvoke(new Action(() => _lblImageStatus.Text = $"⚠ Image too large ({dataBytes/1024/1024} MB)"));
                 return;
             }
 
-            BeginInvoke(new Action(() => _lblImageStatus.Text = "⏳ Rendering image…"));
-
             Task.Run(() =>
             {
-                Log("Image task — started");
                 try
                 {
-                    var bmp = RenderImage(filePath, info, token);
-                    if (token.IsCancellationRequested) { Log("Image task — CANCELLED after render"); return; }
-                    Log($"Image task — bitmap {bmp.Width}×{bmp.Height}");
-
-                    string status =
-                        $"{info.Width}×{info.Height}" +
-                        (info.Planes > 1 ? $"×{info.Planes}" : "") +
-                        $"  BITPIX={info.BitPix}" +
-                        (info.BayerPattern != null ? $"  Bayer:{info.BayerPattern}" : "") +
-                        (info.Filter       != null ? $"  Filter:{info.Filter}" : "");
-
-                    BeginInvoke(new Action(() =>
-                    {
-                        if (token.IsCancellationRequested) return;
-                        _pictureBox.Image?.Dispose();
-                        _pictureBox.Image = bmp;
-                        _lblImageStatus.Text = status;
-                        Log("Image task — displayed OK");
-                    }));
-                }
-                catch (OperationCanceledException) { Log("Image task — CANCELLED by token"); }
-                catch (Exception ex)
-                {
-                    Log("Image task — EXCEPTION: " + ex);
-                    if (!token.IsCancellationRequested)
+                    Bitmap bmp = RenderImage(stream, info, token);
+                    if (bmp != null && !token.IsCancellationRequested)
                     {
                         BeginInvoke(new Action(() =>
-                            _lblImageStatus.Text = $"⚠ Render error: {ex.Message}"));
+                        {
+                            _pictureBox.Image = bmp;
+                            _pictureBox.Visible = true;
+                            _lblImageStatus.Visible = false;
+                        }));
                     }
+                }
+                catch (Exception ex)
+                {
+                    Log("StartImageLoad — EXCEPTION: " + ex);
+                    BeginInvoke(new Action(() => _lblImageStatus.Text = "Render Error: " + ex.Message));
                 }
             }, token);
         }
 
         // ── Rendering pipeline ──────────────────────────────────────────
-        private static Bitmap RenderImage(string filePath, ImageInfo info, System.Threading.CancellationToken token)
+        private static Bitmap RenderImage(Stream stream, ImageInfo info, System.Threading.CancellationToken token)
         {
             const int MAX_DIM = 1000;
             double aspect = (double)info.Width / info.Height;
@@ -360,7 +356,7 @@ namespace FitsPreviewHandler
             Log($"RenderImage — target {outW}×{outH}");
 
             // Read color/mono data
-            float[][] planes = ReadAllPlanes(filePath, info, outW, outH, out int aW, out int aH, token);
+            float[][] planes = ReadAllPlanes(stream, info, outW, outH, out int aW, out int aH, token);
             if (token.IsCancellationRequested) return null;
             Log($"RenderImage — planes={planes.Length} actual={aW}×{aH}");
 
@@ -377,7 +373,7 @@ namespace FitsPreviewHandler
         }
 
         private static float[][] ReadAllPlanes(
-            string filePath, ImageInfo info,
+            Stream stream, ImageInfo info,
             int targetW, int targetH,
             out int actualW, out int actualH,
             System.Threading.CancellationToken token)
@@ -405,62 +401,59 @@ namespace FitsPreviewHandler
             float[][] planes = new float[outPlanes][];
             for (int p = 0; p < outPlanes; p++) planes[p] = new float[actualW * actualH];
 
-            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            byte[] rowBuf = new byte[rowBytes];
+            byte[] nextRowBuf = isBayer ? new byte[rowBytes] : null;
+
+            for (int p = 0; p < info.Planes && p < (isBayer ? 1 : outPlanes); p++)
             {
-                byte[] rowBuf = new byte[rowBytes];
-                byte[] nextRowBuf = isBayer ? new byte[rowBytes] : null;
-
-                for (int p = 0; p < info.Planes && p < (isBayer ? 1 : outPlanes); p++)
+                long planeOff = info.DataOffset + (long)p * info.Height * rowBytes;
+                int outY = 0;
+                for (int y = 0; y <= info.Height - (isBayer ? 2 : 1) && outY < actualH; y += sy)
                 {
-                    long planeOff = info.DataOffset + (long)p * info.Height * rowBytes;
-                    int outY = 0;
-                    for (int y = 0; y <= info.Height - (isBayer ? 2 : 1) && outY < actualH; y += sy)
-                    {
-                        if (token.IsCancellationRequested) break;
+                    if (token.IsCancellationRequested) break;
 
-                        fs.Seek(planeOff + (long)y * rowBytes, SeekOrigin.Begin);
-                        fs.Read(rowBuf, 0, (int)rowBytes);
-                        
-                        if (isBayer) {
-                            fs.Seek(planeOff + (long)(y+1) * rowBytes, SeekOrigin.Begin);
-                            fs.Read(nextRowBuf, 0, (int)rowBytes);
-                        }
-
-                        int outX = 0;
-                        for (int x = 0; x <= info.Width - (isBayer ? 2 : 1) && outX < actualW; x += sx)
-                        {
-                            int idx = (actualH - 1 - outY) * actualW + outX;
-
-                            if (isBayer) {
-                                double p00 = ReadRaw(rowBuf, x * bpp, info.BitPix);
-                                double p10 = ReadRaw(rowBuf, (x+1) * bpp, info.BitPix);
-                                double p01 = ReadRaw(nextRowBuf, x * bpp, info.BitPix);
-                                double p11 = ReadRaw(nextRowBuf, (x+1) * bpp, info.BitPix);
-                                
-                                float r, g, b;
-                                string pat = info.BayerPattern.ToUpper();
-                                if (pat == "RGGB") {
-                                    r=(float)p00; g=(float)(p10+p01)/2f; b=(float)p11;
-                                } else if (pat == "GRBG") {
-                                    g=(float)(p00+p11)/2f; r=(float)p10; b=(float)p01;
-                                } else if (pat == "GBRG") {
-                                    g=(float)(p00+p11)/2f; b=(float)p10; r=(float)p01;
-                                } else { // BGGR
-                                    b=(float)p00; g=(float)(p10+p01)/2f; r=(float)p11; 
-                                }
-
-                                planes[0][idx] = (float)(r * info.BScale + info.BZero);
-                                planes[1][idx] = (float)(g * info.BScale + info.BZero);
-                                planes[2][idx] = (float)(b * info.BScale + info.BZero);
-                            }
-                            else {
-                                double raw = ReadRaw(rowBuf, x * bpp, info.BitPix);
-                                planes[p][idx] = (float)(raw * info.BScale + info.BZero);
-                            }
-                            outX++;
-                        }
-                        outY++;
+                    stream.Seek(planeOff + (long)y * rowBytes, SeekOrigin.Begin);
+                    stream.Read(rowBuf, 0, (int)rowBytes);
+                    
+                    if (isBayer) {
+                        stream.Seek(planeOff + (long)(y+1) * rowBytes, SeekOrigin.Begin);
+                        stream.Read(nextRowBuf, 0, (int)rowBytes);
                     }
+
+                    int outX = 0;
+                    for (int x = 0; x <= info.Width - (isBayer ? 2 : 1) && outX < actualW; x += sx)
+                    {
+                        int idx = (actualH - 1 - outY) * actualW + outX;
+
+                        if (isBayer) {
+                            double p00 = ReadRaw(rowBuf, x * bpp, info.BitPix);
+                            double p10 = ReadRaw(rowBuf, (x+1) * bpp, info.BitPix);
+                            double p01 = ReadRaw(nextRowBuf, x * bpp, info.BitPix);
+                            double p11 = ReadRaw(nextRowBuf, (x+1) * bpp, info.BitPix);
+                            
+                            float r, g, b;
+                            string pat = info.BayerPattern.ToUpper();
+                            if (pat == "RGGB") {
+                                r=(float)p00; g=(float)(p10+p01)/2f; b=(float)p11;
+                            } else if (pat == "GRBG") {
+                                g=(float)(p00+p11)/2f; r=(float)p10; b=(float)p01;
+                            } else if (pat == "GBRG") {
+                                g=(float)(p00+p11)/2f; b=(float)p10; r=(float)p01;
+                            } else { // BGGR
+                                b=(float)p00; g=(float)(p10+p01)/2f; r=(float)p11; 
+                            }
+
+                            planes[0][idx] = (float)(r * info.BScale + info.BZero);
+                            planes[1][idx] = (float)(g * info.BScale + info.BZero);
+                            planes[2][idx] = (float)(b * info.BScale + info.BZero);
+                        }
+                        else {
+                            double raw = ReadRaw(rowBuf, x * bpp, info.BitPix);
+                            planes[p][idx] = (float)(raw * info.BScale + info.BZero);
+                        }
+                        outX++;
+                    }
+                    outY++;
                 }
             }
             return planes;
@@ -679,22 +672,22 @@ namespace FitsPreviewHandler
         }
 
         // ── FITS header + image-metadata parser ─────────────────────────
-        private static (List<(string, string, string)>, ImageInfo) ParseFitsFile(string filePath)
+        private static (List<(string, string, string)>, ImageInfo) ParseFitsStream(Stream stream)
         {
             const int REC = 80, BLOCK = 2880;
             var result = new List<(string, string, string)>();
             var info   = new ImageInfo { BScale = 1.0, Planes = 1 };
 
-            Log($"ParseFitsFile — opening '{filePath}'");
-            using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var br = new BinaryReader(fs, Encoding.ASCII))
+            Log($"ParseFitsStream — pos={stream.Position}");
+            stream.Seek(0, SeekOrigin.Begin);
+            using (var br = new BinaryReader(stream, Encoding.ASCII, true)) // leaveOpen=true
             {
                 bool endFound = false;
                 int  blockIdx = 0;
-                while (!endFound && fs.Position < fs.Length)
+                while (!endFound)
                 {
                     byte[] block = br.ReadBytes(BLOCK);
-                    if (block.Length < REC) break;
+                    if (block.Length < BLOCK) break;
                     int recs = block.Length / REC;
 
                     for (int r = 0; r < recs && !endFound; r++)
@@ -708,7 +701,7 @@ namespace FitsPreviewHandler
                             endFound = true;
                             // data starts at the next 2880-byte boundary
                             info.DataOffset = (long)(blockIdx + 1) * BLOCK;
-                            Log($"ParseFitsFile — END at block {blockIdx} r={r}, DataOffset={info.DataOffset}");
+                            Log($"ParseFitsStream — END at block {blockIdx} r={r}, DataOffset={info.DataOffset}");
                             break;
                         }
 

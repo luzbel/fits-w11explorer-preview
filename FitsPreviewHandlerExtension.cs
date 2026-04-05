@@ -61,7 +61,7 @@ namespace FitsPreviewHandler
         private RECT _bounds;
         private FitsPreviewControl _control;
         private System.Threading.Thread _uiThread;
-        private bool _isTempFile = false;
+        private Stream _stream; // Direct zero-copy stream
         
         // Shared log writer — delegates to the same path used by FitsPreviewControl
         private static void Log(string msg)
@@ -104,43 +104,14 @@ namespace FitsPreviewHandler
             Log($"IInitializeWithStream.Initialize — grfMode={grfMode}, stream is {pstream?.GetType().FullName ?? "null"}");
             try
             {
-                if (pstream is System.Runtime.InteropServices.ComTypes.IStream stream)
+                if (pstream is System.Runtime.InteropServices.ComTypes.IStream comStream)
                 {
-                    // Use the same LocalLow anchor for the temp fits to ensure write permissions
-                    string userProfile = Environment.GetEnvironmentVariable("USERPROFILE");
-                    string baseDir = Path.Combine(userProfile, "AppData", "LocalLow", "FitsPreviewHandler");
-                    if (!Directory.Exists(baseDir)) Directory.CreateDirectory(baseDir);
-
-                    string tempPath = Path.Combine(baseDir, "fitspreview_" + Guid.NewGuid() + ".fits");
-                    Log($"  Writing stream to temp file: {tempPath}");
-                    
-                    using (var fs = File.OpenWrite(tempPath))
-                    {
-                        byte[] buffer = new byte[65536];
-                        long totalRead = 0;
-                        IntPtr readPtr = Marshal.AllocCoTaskMem(sizeof(int));
-                        try
-                        {
-                            while (true)
-                            {
-                                stream.Read(buffer, buffer.Length, readPtr);
-                                int r = Marshal.ReadInt32(readPtr);
-                                if (r <= 0) break;
-                                fs.Write(buffer, 0, r);
-                                totalRead += r;
-                            }
-                            Log($"  Stream read complete: {totalRead} bytes");
-                            fs.Flush();
-                        }
-                        finally { Marshal.FreeCoTaskMem(readPtr); }
-                    }
-                    _filePath = tempPath;
-                    _isTempFile = true;
-                    Log($"  Temp file written OK: {_filePath}");
+                    _stream = new ComStreamWrapper(comStream);
+                    Log("  Stream wrapped OK — ready for Zero-Copy");
                 }
                 else
                 {
-                    Log("  WARNING: pstream does not implement IStream — cannot read");
+                    Log("  WARNING: pstream does not implement IStream");
                 }
             }
             catch (Exception ex) { Log("  EXCEPTION in IInitializeWithStream.Initialize: " + ex); }
@@ -292,14 +263,19 @@ namespace FitsPreviewHandler
                         _control.Show();
                         Log("UI Thread — control shown");
 
-                        if (!string.IsNullOrEmpty(pathToLoad))
+                        if (_stream != null)
                         {
-                            Log($"UI Thread — calling LoadFits('{pathToLoad}')");
+                            Log("UI Thread — loading from direct STREAM");
+                            _control.LoadFits(_stream, "FITS Stream");
+                        }
+                        else if (!string.IsNullOrEmpty(pathToLoad))
+                        {
+                            Log($"UI Thread — loading from PATH: '{pathToLoad}'");
                             _control.LoadFits(pathToLoad);
                         }
                         else
                         {
-                            Log("UI Thread — WARNING: pathToLoad is empty, nothing to load");
+                            Log("UI Thread — WARNING: no stream or path to load");
                         }
 
                         // Keep the STA message pump alive indefinitely
@@ -349,19 +325,11 @@ namespace FitsPreviewHandler
                 Log("Unload — control was null or handle not created");
             }
             _uiThread = null;
-            Log("Unload — cleaning up temp data");
-            if (_isTempFile && !string.IsNullOrEmpty(_filePath))
+            Log("Unload — cleaning up");
+            if (_stream != null)
             {
-                try
-                {
-                    if (File.Exists(_filePath))
-                    {
-                        File.Delete(_filePath);
-                        Log($"Unload — Deleted temp file: {_filePath}");
-                    }
-                }
-                catch (Exception ex) { Log("Unload — Could not delete temp file: " + ex.Message); }
-                _isTempFile = false;
+                try { _stream.Dispose(); } catch { }
+                _stream = null;
             }
             Log("Unload — done");
         }
