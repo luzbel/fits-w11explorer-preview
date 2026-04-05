@@ -58,6 +58,7 @@ namespace FitsPreviewHandler
 
         internal static void Log(string msg)
         {
+            if (!Settings.EnableTracing) return;
             msg = $"[{DateTime.Now:HH:mm:ss.fff}] [UI] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {msg}";
             System.Diagnostics.Debug.WriteLine(msg);
             try
@@ -74,6 +75,8 @@ namespace FitsPreviewHandler
         private DataGridView  _gridHeader;
         private PictureBox    _pictureBox;
         private Label         _lblProgress;
+        private Label         _lblImageHint;
+        private Label         _lblLogStatus;
         private TextBox       _txtError;
 
         // ── Concurrency ─────────────────────────────────────────────────
@@ -122,19 +125,55 @@ namespace FitsPreviewHandler
                 ForeColor = Color.FromArgb(140, 200, 255),
                 Font = new Font("Segoe UI", 10f, FontStyle.Bold)
             };
+            _lblLogStatus = new Label
+            {
+                AutoSize = true, Dock = DockStyle.Right,
+                TextAlign = ContentAlignment.MiddleRight,
+                Text = "Log: ?",
+                ForeColor = Color.FromArgb(120, 120, 150),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Italic),
+                Padding = new Padding(0, 0, 10, 0),
+                Cursor = Cursors.Hand
+            };
             _topPanel.Controls.Add(_lblTitle);
+            _topPanel.Controls.Add(_lblLogStatus);
 
             // ── SplitContainer (Top=Image, Bottom=Grid) ──────────────────
             _split = new SplitContainer
             {
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Horizontal,
-                SplitterDistance = 350,
                 FixedPanel = FixedPanel.Panel1,
                 BorderStyle = BorderStyle.None,
-                Panel1MinSize = 50, Panel2MinSize = 50,
+                Panel1MinSize = 250, Panel2MinSize = 50,
                 BackColor = Color.FromArgb(24, 24, 36)
             };
+            
+            // Set initial position: handle initialization and the 50/50 split during resizing
+            _split.Resize += (s, e) => {
+                if (_split.Height < 100) return; // Wait for valid size
+
+                int savedPos = Settings.SplitterDistance;
+                if (savedPos > 0)
+                {
+                    // Enforce our 250px minimum safety even for saved values
+                    int targetPos = Math.Max(250, savedPos);
+                    if (_split.SplitterDistance != targetPos && targetPos < _split.Height - 50)
+                    {
+                        _split.SplitterDistance = targetPos;
+                        Log($"Resize (Stored) — SplitterDistance forced to {targetPos} (Height={_split.Height})");
+                    }
+                }
+                else if (savedPos == -1)
+                {
+                    // Dynamic 50/50 split
+                    _split.SplitterDistance = _split.Height / 2;
+                    Log($"Resize (Initial Auto) — SplitterDistance set to {_split.SplitterDistance} (Height={_split.Height})");
+                }
+            };
+
+            // Persist splitter position
+            _split.SplitterMoved += (s, e) => Settings.SplitterDistance = _split.SplitterDistance;
             
             // Image Panel (Panel1)
             _pictureBox = new PictureBox
@@ -164,7 +203,19 @@ namespace FitsPreviewHandler
                 _lblProgress.Top = (_split.Panel1.Height - _lblProgress.Height) / 2;
             };
 
+            _lblImageHint = new Label
+            {
+                AutoSize = false, Dock = DockStyle.Bottom, Height = 40,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Text = "",
+                ForeColor = Color.FromArgb(110, 115, 140),
+                BackColor = Color.FromArgb(15, 15, 25),
+                Font = new Font("Consolas", 8.5f),
+                Visible = false
+            };
+
             _split.Panel1.Controls.Add(_lblProgress);
+            _split.Panel1.Controls.Add(_lblImageHint);
             _split.Panel1.Controls.Add(_pictureBox);
 
             // Grid (Panel2)
@@ -262,6 +313,38 @@ namespace FitsPreviewHandler
         public void LoadFits(Stream stream, string fileName)
         {
             Log($"LoadFits(Stream) — '{fileName}' length={stream.Length}");
+            
+            bool showImg = Settings.ShowImage;
+            bool logOn   = Settings.EnableTracing;
+            Log($"LoadFits — ShowImage={showImg} Log={logOn} SplitterDistance={_split.SplitterDistance} TotalHeight={_split.Height}");
+
+            Action updateLayout = () => {
+                // If image is disabled, show placeholder text in Panel1 instead of collapsing it
+                _pictureBox.Visible = showImg;
+                _lblImageHint.Visible = true;
+                
+                string regPath = @"HKCU\" + Settings.REG_PATH;
+                string hintImg = showImg 
+                    ? $"Para DESACTIVAR la imagen: Cambiar a 0 la clave {regPath}\\{Settings.VAL_SHOW_IMAGE} con regedit.exe"
+                    : $"Para ACTIVAR la imagen: Cambiar a 1 la clave {regPath}\\{Settings.VAL_SHOW_IMAGE} con regedit.exe";
+                
+                string hintLog = logOn
+                    ? $"Para DESACTIVAR los logs: Cambiar a 0 la clave {regPath}\\{Settings.VAL_ENABLE_LOG} con regedit.exe"
+                    : $"Para ACTIVAR los logs: Cambiar a 1 la clave {regPath}\\{Settings.VAL_ENABLE_LOG} con regedit.exe";
+
+                if (!showImg)
+                {
+                    _lblProgress.Visible = false;
+                }
+                
+                _lblImageHint.Text = hintImg + "\r\n" + hintLog;
+                _lblImageHint.Visible = true;
+
+                _lblLogStatus.Text = "Trace: " + (logOn ? "ON" : "OFF");
+                _lblLogStatus.ForeColor = logOn ? Color.FromArgb(150, 255, 150) : Color.FromArgb(120, 120, 140);
+            };
+            if (InvokeRequired) Invoke(updateLayout); else updateLayout();
+
             try
             {
                 var (rows, info) = ParseFitsStream(stream);
@@ -270,13 +353,15 @@ namespace FitsPreviewHandler
                 Action populate = () => PopulateGrid(rows, fileName, info);
                 if (InvokeRequired) Invoke(populate); else populate();
 
-                if (info.HasImage)
+                if (showImg && info.HasImage)
                 {
                     CancelOldLoad();
                     StartImageLoad(stream, info, _cts.Token);
                 }
+                else if (!showImg)
+                    Log("LoadFits — image loading disabled in registry");
                 else
-                    Log("LoadFits — no image data");
+                    Log("LoadFits — no image data to display");
             }
             catch (Exception ex)
             {
@@ -298,6 +383,8 @@ namespace FitsPreviewHandler
                   (info.Planes > 1 ? $"×{info.Planes}" : "") +
                   $"  BITPIX={info.BitPix}"
                 : " · no image";
+            
+            if (!Settings.ShowImage) imgNote += " (Image hidden)";
             _lblTitle.Text = fileName + imgNote;
 
             foreach (var (kw, val, comment) in rows)
@@ -811,7 +898,6 @@ namespace FitsPreviewHandler
             }
         }
 
-        // ── Error display ───────────────────────────────────────────────
         public void ShowError(string message)
         {
             Log("ShowError — " + message.Replace("\r\n", " | ").Replace("\n", " | "));

@@ -64,8 +64,9 @@ namespace FitsPreviewHandler
         private Stream _stream; // Direct zero-copy stream
         
         // Shared log writer — delegates to the same path used by FitsPreviewControl
-        private static void Log(string msg)
+        private static void Log(string msg, bool force = false)
         {
+            if (!force && !Settings.EnableTracing) return;
             msg = $"[{DateTime.Now:HH:mm:ss.fff}] [Extension] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {msg}";
             System.Diagnostics.Debug.WriteLine(msg);
             try
@@ -308,11 +309,12 @@ namespace FitsPreviewHandler
             if (_control != null && _control.IsHandleCreated)
             {
                 Log("Unload — disposing control and exiting UI thread message loop");
-                _control.BeginInvoke(new Action(() =>
+                var controlToDispose = _control;
+                controlToDispose.BeginInvoke(new Action(() =>
                 {
                     try
                     {
-                        _control.Dispose();
+                        controlToDispose.Dispose();
                         Application.ExitThread();
                         Log("Unload — Application.ExitThread called inside UI thread");
                     }
@@ -365,7 +367,23 @@ namespace FitsPreviewHandler
                 // Standard Microsoft AppID for Preview Host (prevhost.exe)
                 string appid = "{6d2b5079-2f0b-48dd-ab7f-97cec514d30b}";
                 
-                Log($"--- Registering Preview Handler {guid} ---");
+                Log($"--- Registering Preview Handler {guid} ---", true);
+
+                // 0. Create Configuration keys in HKLM (Safe defaults for all users)
+                try {
+                    using (RegistryKey key = Registry.LocalMachine.CreateSubKey(Settings.REG_PATH))
+                    {
+                        if (key != null) {
+                            if (key.GetValue(Settings.VAL_SHOW_IMAGE) == null) 
+                                key.SetValue(Settings.VAL_SHOW_IMAGE, 1, RegistryValueKind.DWord);
+                            if (key.GetValue(Settings.VAL_ENABLE_LOG) == null) 
+                                key.SetValue(Settings.VAL_ENABLE_LOG, 0, RegistryValueKind.DWord);
+                            if (key.GetValue(Settings.VAL_SPLITTER_POS) == null) 
+                                key.SetValue(Settings.VAL_SPLITTER_POS, -1, RegistryValueKind.DWord);
+                        }
+                    }
+                    Log("  Configuration keys created in HKLM", true);
+                } catch (Exception ex) { Log("  WARNING: Could not create HKLM config keys: " + ex.Message, true); }
 
                 // 1. .fits -> PerceivedType = image
                 using (RegistryKey key = Registry.ClassesRoot.CreateSubKey(".fits"))
@@ -390,15 +408,12 @@ namespace FitsPreviewHandler
                 {
                     key.SetValue("AppID", appid);
                 }
-
-                // NOTE: We no longer need to manually set InprocServer32/CodeBase 
-                // because regasm /codebase handles it when used correctly.
                 
-                Log("  Registration complete OK");
+                Log("  Registration complete OK", true);
             }
             catch (Exception ex)
             {
-                Log("  ERROR during registration: " + ex);
+                Log("  ERROR during registration: " + ex, true);
                 throw; 
             }
         }
@@ -409,7 +424,7 @@ namespace FitsPreviewHandler
             try
             {
                 string guid = t.GUID.ToString("B").ToUpper();
-                Log($"--- Unregistering Preview Handler {guid} ---");
+                Log($"--- Unregistering Preview Handler {guid} ---", true);
 
                 // Remove .fits association
                 Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{8895b1c6-b41f-4c1c-a562-0d564250836f}", false);
@@ -420,19 +435,20 @@ namespace FitsPreviewHandler
                     if (key != null) key.DeleteValue(guid, false);
                 }
 
-                // Clean up AppID reference (optional, regasm /u cleans most CLSID keys)
+                // Clean up AppID reference
                 using (RegistryKey key = Registry.ClassesRoot.OpenSubKey("CLSID\\" + guid, true))
                 {
-                    if (key != null) {
-                        key.DeleteValue("AppID", false);
-                    }
+                    if (key != null) key.DeleteValue("AppID", false);
                 }
 
-                Log("  Unregistration complete OK");
+                // We keep the settings in HKCU/AppDataLow as they might be useful if reinstalled,
+                // and it's safer not to touch user-specific AppDataLow registry during unregister if not strictly needed.
+
+                Log("  Unregistration complete OK", true);
             }
             catch (Exception ex)
             {
-                Log("  ERROR during unregistration: " + ex);
+                Log("  ERROR during unregistration: " + ex, true);
             }
         }
 
