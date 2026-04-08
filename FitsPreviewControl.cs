@@ -289,6 +289,81 @@ namespace FitsPreviewHandler
                 Font = new Font("Consolas", 9f), ScrollBars = ScrollBars.Vertical
             };
 
+            // ── Context Menu ──────────────────────────────────────────────
+            var ctxMenu = new ContextMenuStrip();
+            ctxMenu.RenderMode = ToolStripRenderMode.System;
+            
+            this.ContextMenuStrip = ctxMenu;
+            _pictureBox.ContextMenuStrip = ctxMenu;
+            _gridHeader.ContextMenuStrip = ctxMenu;
+            _split.ContextMenuStrip = ctxMenu;
+            _split.Panel1.ContextMenuStrip = ctxMenu;
+            _split.Panel2.ContextMenuStrip = ctxMenu;
+            _topPanel.ContextMenuStrip = ctxMenu;
+            _lblImageHint.ContextMenuStrip = ctxMenu;
+
+            ctxMenu.Opening += (s, e) => {
+                ctxMenu.Items.Clear();
+                bool currentShowImg = Settings.ShowImage;
+                bool currentLogOn = Settings.EnableTracing;
+                string scriptRegPath = "HKCU\\" + Settings.REG_PATH;
+
+                var itemImg = new ToolStripMenuItem(currentShowImg ? "Copiar comando cmd para DESACTIVAR imagen" : "Copiar comando cmd para ACTIVAR imagen");
+                itemImg.Click += (sender, args) => {
+                    string cmd = $"reg add \"{scriptRegPath}\" /v {Settings.VAL_SHOW_IMAGE} /t REG_DWORD /d {(currentShowImg ? 0 : 1)} /f";
+                    Clipboard.SetText(cmd);
+                };
+                
+                var itemLog = new ToolStripMenuItem(currentLogOn ? "Copiar comando cmd para DESACTIVAR logs" : "Copiar comando cmd para ACTIVAR logs");
+                itemLog.Click += (sender, args) => {
+                    string cmd = $"reg add \"{scriptRegPath}\" /v {Settings.VAL_ENABLE_LOG} /t REG_DWORD /d {(currentLogOn ? 0 : 1)} /f";
+                    Clipboard.SetText(cmd);
+                };
+
+                ctxMenu.Items.Add(itemImg);
+                ctxMenu.Items.Add(itemLog);
+                
+                ctxMenu.Items.Add(new ToolStripSeparator());
+
+                if (_pictureBox.Image != null && currentShowImg)
+                {
+                    var itemCopyImg = new ToolStripMenuItem($"Copiar imagen ({_pictureBox.Image.Width}x{_pictureBox.Image.Height})");
+                    itemCopyImg.Click += (sender, args) => {
+                        try { Clipboard.SetImage(_pictureBox.Image); } catch { }
+                    };
+                    ctxMenu.Items.Add(itemCopyImg);
+                }
+                
+                if (_gridHeader.SelectedRows.Count > 0)
+                {
+                    var itemCopy = new ToolStripMenuItem("Copiar fila seleccionada");
+                    itemCopy.Click += (sender, args) => {
+                        var row = _gridHeader.SelectedRows[0];
+                        string text = $"{row.Cells[0].Value}={row.Cells[1].Value} // {row.Cells[2].Value}";
+                        try { Clipboard.SetText(text); } catch { }
+                    };
+                    ctxMenu.Items.Add(itemCopy);
+                }
+
+                var itemCopyCsv = new ToolStripMenuItem("Copiar toda la tabla (CSV)");
+                itemCopyCsv.Click += (sender, args) => {
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine("\"Keyword\",\"Value\",\"Comment\"");
+                    foreach (DataGridViewRow r in _gridHeader.Rows)
+                    {
+                        string c0 = r.Cells[0].Value?.ToString() ?? "";
+                        string c1 = r.Cells[1].Value?.ToString() ?? "";
+                        string c2 = r.Cells[2].Value?.ToString() ?? "";
+                        c0 = c0.Replace("\"", "\"\"");
+                        c1 = c1.Replace("\"", "\"\"");
+                        c2 = c2.Replace("\"", "\"\"");
+                        sb.AppendLine($"\"{c0}\",\"{c1}\",\"{c2}\"");
+                    }
+                    try { Clipboard.SetText(sb.ToString()); } catch { }
+                };
+                ctxMenu.Items.Add(itemCopyCsv);
+            };
+
             Controls.Add(_split);
             Controls.Add(_topPanel);
             Controls.Add(_txtError);
@@ -332,21 +407,12 @@ namespace FitsPreviewHandler
                 _pictureBox.Visible = showImg;
                 _lblImageHint.Visible = true;
                 
-                string regPath = @"HKCU\" + Settings.REG_PATH;
-                string hintImg = showImg 
-                    ? $"Para DESACTIVAR la imagen: Cambiar a 0 la clave {regPath}\\{Settings.VAL_SHOW_IMAGE} con regedit.exe"
-                    : $"Para ACTIVAR la imagen: Cambiar a 1 la clave {regPath}\\{Settings.VAL_SHOW_IMAGE} con regedit.exe";
-                
-                string hintLog = logOn
-                    ? $"Para DESACTIVAR los logs: Cambiar a 0 la clave {regPath}\\{Settings.VAL_ENABLE_LOG} con regedit.exe"
-                    : $"Para ACTIVAR los logs: Cambiar a 1 la clave {regPath}\\{Settings.VAL_ENABLE_LOG} con regedit.exe";
-
                 if (!showImg)
                 {
                     _lblProgress.Visible = false;
                 }
                 
-                _lblImageHint.Text = hintImg + "\r\n" + hintLog;
+                _lblImageHint.Text = "Right-Click for configuration options";
                 _lblImageHint.Visible = true;
 
                 _lblLogStatus.Text = "Trace: " + (logOn ? "ON" : "OFF");
