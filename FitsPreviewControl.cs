@@ -130,7 +130,7 @@ namespace FitsPreviewHandler
             {
                 AutoSize = false, Dock = DockStyle.Fill,
                 TextAlign = ContentAlignment.MiddleLeft,
-                Text = "FITS Preview",
+                Text = Strings.Title,
                 ForeColor = Color.FromArgb(140, 200, 255),
                 Font = new Font("Segoe UI", 10f, FontStyle.Bold)
             };
@@ -138,7 +138,7 @@ namespace FitsPreviewHandler
             {
                 AutoSize = true, Dock = DockStyle.Right,
                 TextAlign = ContentAlignment.MiddleRight,
-                Text = "Log: ?",
+                Text = Strings.LogStatus(false),
                 ForeColor = Color.FromArgb(120, 120, 150),
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Italic),
                 Padding = new Padding(0, 0, 10, 0),
@@ -307,18 +307,18 @@ namespace FitsPreviewHandler
                 bool currentShowImg = Settings.ShowImage;
                 bool currentLogOn = Settings.EnableTracing;
 
-                var itemImg = new ToolStripMenuItem(currentShowImg ? "Ocultar imagen (carga más rápida). Solo mostrar metadatos" : "Previsualizar imagen con auto-stretch");
+                var itemImg = new ToolStripMenuItem(currentShowImg ? Strings.MenuHideImage : Strings.MenuShowImage);
                 itemImg.Click += (sender, args) => {
                     Settings.ShowImage = !currentShowImg;
-                    _lblImageHint.Text = "¡Guardado! Selecciona otro archivo FITS para previsualizar con la nueva configuración.";
+                    _lblImageHint.Text = Strings.MenuSavedImage;
                     _lblImageHint.ForeColor = Color.FromArgb(180, 255, 180);
                     _lblImageHint.Visible = true;
                 };
                 
-                var itemLog = new ToolStripMenuItem(currentLogOn ? "Desactivar trazas (Trace: OFF)" : "Activar trazas para depurar en %USERPROFILE%\\AppData\\LocalLow\\FitsPreviewHandler  (Trace: ON)");
+                var itemLog = new ToolStripMenuItem(currentLogOn ? Strings.MenuDisableTrace : Strings.MenuEnableTrace);
                 itemLog.Click += (sender, args) => {
                     Settings.EnableTracing = !currentLogOn;
-                    _lblImageHint.Text = "¡Guardado! Selecciona otro archivo FITS para aplicar la nueva configuración de trazas.";
+                    _lblImageHint.Text = Strings.MenuSavedTrace;
                     _lblImageHint.ForeColor = Color.FromArgb(180, 255, 180);
                     _lblImageHint.Visible = true;
                 };
@@ -330,7 +330,7 @@ namespace FitsPreviewHandler
 
                 if (_pictureBox.Image != null && currentShowImg)
                 {
-                    var itemCopyImg = new ToolStripMenuItem($"Copiar imagen ({_pictureBox.Image.Width}x{_pictureBox.Image.Height})");
+                    var itemCopyImg = new ToolStripMenuItem(Strings.MenuCopyImage(_pictureBox.Image.Width, _pictureBox.Image.Height));
                     itemCopyImg.Click += (sender, args) => {
                         try { Clipboard.SetImage(_pictureBox.Image); } catch { }
                     };
@@ -339,7 +339,7 @@ namespace FitsPreviewHandler
                 
                 if (_gridHeader.SelectedRows.Count > 0)
                 {
-                    var itemCopy = new ToolStripMenuItem("Copiar fila seleccionada");
+                    var itemCopy = new ToolStripMenuItem(Strings.MenuCopyRow);
                     itemCopy.Click += (sender, args) => {
                         var row = _gridHeader.SelectedRows[0];
                         string text = $"{row.Cells[0].Value}={row.Cells[1].Value} // {row.Cells[2].Value}";
@@ -348,7 +348,7 @@ namespace FitsPreviewHandler
                     ctxMenu.Items.Add(itemCopy);
                 }
 
-                var itemCopyCsv = new ToolStripMenuItem("Copiar toda la tabla (CSV)");
+                var itemCopyCsv = new ToolStripMenuItem(Strings.MenuCopyCsv);
                 itemCopyCsv.Click += (sender, args) => {
                     var sb = new System.Text.StringBuilder();
                     sb.AppendLine("\"Keyword\",\"Value\",\"Comment\"");
@@ -382,7 +382,7 @@ namespace FitsPreviewHandler
                 if (!File.Exists(filePath))
                 {
                     Log("LoadFits — file NOT FOUND");
-                    ShowError($"File not found:\n{filePath}");
+                    ShowError(Strings.FileNotFound + filePath);
                     return;
                 }
                 using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
@@ -393,7 +393,7 @@ namespace FitsPreviewHandler
             catch (Exception ex)
             {
                 Log("LoadFits(string) — EXCEPTION: " + ex);
-                ShowError("Error opening FITS file:\r\n" + ex.Message);
+                ShowError(Strings.ErrorOpening + ex.Message);
             }
         }
 
@@ -415,10 +415,10 @@ namespace FitsPreviewHandler
                     _lblProgress.Visible = false;
                 }
                 
-                _lblImageHint.Text = "Right-Click for configuration and copy options";
+                _lblImageHint.Text = Strings.RightClickHint;
                 _lblImageHint.Visible = true;
 
-                _lblLogStatus.Text = "Trace: " + (logOn ? "ON" : "OFF");
+                _lblLogStatus.Text = Strings.LogStatus(logOn);
                 _lblLogStatus.ForeColor = logOn ? Color.FromArgb(150, 255, 150) : Color.FromArgb(120, 120, 140);
             };
             if (InvokeRequired) Invoke(updateLayout); else updateLayout();
@@ -444,7 +444,7 @@ namespace FitsPreviewHandler
             catch (Exception ex)
             {
                 Log("LoadFits(Stream) — EXCEPTION: " + ex);
-                ShowError("Error reading FITS stream:\r\n" + ex.Message);
+                ShowError(Strings.ErrorReadingStream + ex.Message);
             }
         }
 
@@ -460,9 +460,9 @@ namespace FitsPreviewHandler
                 ? $" · {info.Width}×{info.Height}" +
                   (info.Planes > 1 ? $"×{info.Planes}" : "") +
                   $"  BITPIX={info.BitPix}"
-                : " · no image";
+                : Strings.NoImageHint;
             
-            if (!Settings.ShowImage) imgNote += " (Image hidden)";
+            if (!Settings.ShowImage) imgNote += Strings.ImageHiddenHint;
             _lblTitle.Text = fileName + imgNote;
 
             foreach (var (kw, val, comment) in rows)
@@ -482,7 +482,7 @@ namespace FitsPreviewHandler
 
             if (info.BitPix == 0)
             {
-                BeginInvoke(new Action(() => _lblProgress.Text = "⚠ BITPIX=0, cannot render"));
+                BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderBitpix0));
                 return;
             }
 
@@ -490,7 +490,7 @@ namespace FitsPreviewHandler
             long dataBytes = (long)info.Width * info.Height * info.Planes * info.BytesPerPixel;
             if (dataBytes > MAX_BYTES)
             {
-                BeginInvoke(new Action(() => _lblProgress.Text = $"⚠ Image too large ({dataBytes/1024/1024} MB)"));
+                BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderTooLarge(dataBytes/1024/1024)));
                 return;
             }
 
@@ -518,7 +518,7 @@ namespace FitsPreviewHandler
                 {
                     Log("StartImageLoad — EXCEPTION: " + ex);
                     BeginInvoke(new Action(() => {
-                        _lblProgress.Text = "Render Error: " + ex.Message;
+                        _lblProgress.Text = Strings.RenderError(ex.Message);
                         _lblProgress.Visible = true;
                     }));
                 }
@@ -599,7 +599,7 @@ namespace FitsPreviewHandler
                     if (y % (sy * 20) == 0) // Report progress every 20 output rows
                     {
                         double progress = 100.0 * (p * info.Height + y) / (info.Planes * info.Height);
-                        reportProgress?.Invoke($"Reading FITS data... {progress:F0}%");
+                        reportProgress?.Invoke(Strings.RenderProgress(progress));
                     }
 
                     stream.Seek(planeOff + (long)y * rowBytes, SeekOrigin.Begin);
