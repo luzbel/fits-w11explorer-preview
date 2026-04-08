@@ -25,6 +25,15 @@ namespace FitsPreviewHandler
         public long   DataOffset;    // byte offset of first pixel in file
         public bool   HasImage;      // true when Width>0 && Height>0
 
+        // Additional fields for Property Handler
+        public string Camera;
+        public string Instrument;
+        public string Telescope;
+        public string Object;
+        public string DateObs;
+        public double Exposure;
+        public string Software;
+
         public int  BytesPerPixel => Math.Abs(BitPix) / 8;
         public override string ToString() =>
             $"{Width}x{Height} Planes={Planes} BITPIX={BitPix} " +
@@ -784,7 +793,7 @@ namespace FitsPreviewHandler
         }
 
         // ── FITS header + image-metadata parser ─────────────────────────
-        private static (List<(string, string, string)>, ImageInfo) ParseFitsStream(Stream stream)
+        internal static (List<(string, string, string)>, ImageInfo) ParseFitsStream(Stream stream)
         {
             const int REC = 80, BLOCK = 2880;
             var result = new List<(string, string, string)>();
@@ -846,6 +855,16 @@ namespace FitsPreviewHandler
                                     if (info.BayerPattern == null) info.BayerPattern = val.Trim();
                                     break;
                                 case "FILTER":  info.Filter = val.Trim(); break;
+                                case "INSTRUME": info.Instrument = val; break;
+                                case "TELESCOP": info.Telescope = val; break;
+                                case "OBJECT": info.Object = val; break;
+                                case "DATE-OBS": info.DateObs = val; break;
+                                case "EXPTIME":
+                                case "EXPOSURE": double.TryParse(val, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out info.Exposure); break;
+                                case "SWCREATE":
+                                case "CREATOR":
+                                case "PROGRAM": info.Software = val; break;
+                                case "CAMERA": info.Camera = val; break;
                             }
                         }
                         else

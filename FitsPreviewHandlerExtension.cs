@@ -44,6 +44,75 @@ namespace FitsPreviewHandler
         [PreserveSig] uint TranslateAccelerator(ref MSG pmsg);
     }
     
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99")]
+    public interface IPropertyStore
+    {
+        [PreserveSig] uint GetCount(out uint cProps);
+        [PreserveSig] uint GetAt(uint iProp, out PropertyKey pkey);
+        [PreserveSig] uint GetValue(ref PropertyKey key, out PropVariant pv);
+        [PreserveSig] uint SetValue(ref PropertyKey key, ref PropVariant pv);
+        [PreserveSig] uint Commit();
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PropertyKey
+    {
+        public Guid fmtid;
+        public uint pid;
+        public override bool Equals(object obj) => obj is PropertyKey pk && pk.fmtid == fmtid && pk.pid == pid;
+        public override int GetHashCode() => fmtid.GetHashCode() ^ (int)pid;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    public struct PropVariant : IDisposable
+    {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr ptr;
+        [FieldOffset(8)] public long value;
+        [FieldOffset(8)] public int iVal;
+        [FieldOffset(8)] public double dblVal;
+
+        public void SetString(string val)
+        {
+            vt = 31; // VT_LPWSTR
+            ptr = Marshal.StringToCoTaskMemUni(val);
+        }
+
+        public void SetInt(int val)
+        {
+            vt = 3; // VT_I4
+            iVal = val;
+        }
+
+        public void SetDouble(double val)
+        {
+            vt = 5; // VT_R8
+            dblVal = val;
+        }
+
+        [DllImport("ole32.dll")]
+        public static extern int PropVariantClear(ref PropVariant pvar);
+
+        public void Dispose()
+        {
+            PropVariantClear(ref this);
+        }
+    }
+
+    public static class PKEYs
+    {
+        public static readonly Guid PSG_SUMMARY = new Guid("F29F85E0-4FF9-1068-AB91-08002B27B3D9");
+        public static readonly Guid PSG_IMAGE   = new Guid("6444048F-4C8B-11D1-8B70-080036B11A03");
+        public static readonly Guid PKEY_Photo  = new Guid("14B81DA1-0135-4D31-96D9-6CBFC9671A99");
+
+        public static PropertyKey Subject           = new PropertyKey { fmtid = PSG_SUMMARY, pid = 3 };
+        public static PropertyKey Image_Width       = new PropertyKey { fmtid = PSG_IMAGE, pid = 3 };
+        public static PropertyKey Image_Height      = new PropertyKey { fmtid = PSG_IMAGE, pid = 4 };
+        public static PropertyKey Image_BitDepth    = new PropertyKey { fmtid = PSG_IMAGE, pid = 7 };
+        public static PropertyKey Photo_CameraModel = new PropertyKey { fmtid = PKEY_Photo, pid = 272 };
+        public static PropertyKey Photo_Exposure    = new PropertyKey { fmtid = PKEY_Photo, pid = 33434 };
+    }
+
     [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("fc4801a3-2ba9-11cf-a229-00aa003d7352")]
     public interface IObjectWithSite
     {
@@ -54,7 +123,7 @@ namespace FitsPreviewHandler
     [ComVisible(true)]
     [Guid("AF1C3D6A-81E9-4F5B-9A8C-2D9E71F04B3E")]
     [ClassInterface(ClassInterfaceType.None)]
-    public class FitsPreviewHandlerExtension : IPreviewHandler, IInitializeWithFile, IInitializeWithStream, IInitializeWithItem, IObjectWithSite
+    public class FitsPreviewHandlerExtension : IPreviewHandler, IInitializeWithFile, IInitializeWithStream, IInitializeWithItem, IObjectWithSite, IPropertyStore
     {
         private string _filePath;
         private IntPtr _parentHwnd;
@@ -62,6 +131,7 @@ namespace FitsPreviewHandler
         private FitsPreviewControl _control;
         private System.Threading.Thread _uiThread;
         private Stream _stream; // Direct zero-copy stream
+        private ImageInfo? _metadata; // Cached metadata for property store
         
         // Shared log writer — delegates to the same path used by FitsPreviewControl
         private static void Log(string msg, bool force = false)
@@ -98,6 +168,7 @@ namespace FitsPreviewHandler
         {
             Log($"IInitializeWithFile.Initialize — path='{pszFilePath}' grfMode={grfMode}");
             _filePath = pszFilePath;
+            _metadata = null;
         }
 
         void IInitializeWithStream.Initialize(object pstream, uint grfMode)
@@ -107,15 +178,16 @@ namespace FitsPreviewHandler
             {
                 if (pstream is System.Runtime.InteropServices.ComTypes.IStream comStream)
                 {
+                    Log($"IInitializeWithStream.Initialize — ready for Zero-Copy");
                     _stream = new ComStreamWrapper(comStream);
-                    Log("  Stream wrapped OK — ready for Zero-Copy");
                 }
                 else
                 {
                     Log("  WARNING: pstream does not implement IStream");
                 }
+                _metadata = null;
             }
-            catch (Exception ex) { Log("  EXCEPTION in IInitializeWithStream.Initialize: " + ex); }
+            catch (Exception ex) { Log("IInitializeWithStream EXCEPTION: " + ex); }
         }
 
         void IInitializeWithItem.Initialize(object psiObj, uint grfMode)
@@ -356,6 +428,80 @@ namespace FitsPreviewHandler
         public void SetSite(object pUnkSite) { _site = pUnkSite; }
         public void GetSite(ref Guid riid, out object ppvSite) { ppvSite = _site; }
 
+        // ── IPropertyStore Implementation ───────────────────────────────
+        private ImageInfo? GetMetadata()
+        {
+            if (_metadata.HasValue) return _metadata;
+            
+            Stream streamToParse = null;
+            bool shouldDispose = false;
+
+            if (_stream != null)
+                streamToParse = _stream;
+            else if (!string.IsNullOrEmpty(_filePath))
+            {
+                streamToParse = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                shouldDispose = true;
+            }
+
+            if (streamToParse != null)
+            {
+                try 
+                {
+                    var (_, info) = FitsPreviewControl.ParseFitsStream(streamToParse);
+                    _metadata = info;
+                }
+                finally { if (shouldDispose) streamToParse.Dispose(); }
+            }
+            
+            return _metadata;
+        }
+
+        public uint GetCount(out uint cProps) 
+        { 
+            cProps = 6;
+            Log("IPropertyStore.GetCount — returning 6");
+            return 0; // S_OK
+        }
+
+        public uint GetAt(uint iProp, out PropertyKey pkey)
+        {
+            Log($"IPropertyStore.GetAt — requested index {iProp}");
+            if (iProp == 0) pkey = PKEYs.Subject;
+            else if (iProp == 1) pkey = PKEYs.Photo_CameraModel;
+            else if (iProp == 2) pkey = PKEYs.Photo_Exposure;
+            else if (iProp == 3) pkey = PKEYs.Image_Width;
+            else if (iProp == 4) pkey = PKEYs.Image_Height;
+            else if (iProp == 5) pkey = PKEYs.Image_BitDepth;
+            else { pkey = new PropertyKey(); return 1; /* S_FALSE */ }
+            return 0;
+        }
+
+        public uint GetValue(ref PropertyKey key, out PropVariant pv)
+        {
+            pv = new PropVariant();
+            Log($"IPropertyStore.GetValue — requested {key.fmtid} pid={key.pid}");
+            var metaP = GetMetadata();
+            if (!metaP.HasValue) {
+                Log("  GetMetadata() failed.");
+                return 0x80004005; // E_FAIL
+            }
+            var meta = metaP.Value;
+
+            if (key.Equals(PKEYs.Subject)) { pv.SetString(meta.Object ?? ""); Log($"  Returned Subject: {meta.Object}"); }
+            else if (key.Equals(PKEYs.Photo_CameraModel)) { pv.SetString(meta.Instrument ?? meta.Camera ?? ""); Log($"  Returned Camera: {meta.Instrument ?? meta.Camera}"); }
+            else if (key.Equals(PKEYs.Image_Width)) { pv.SetInt(meta.Width); Log($"  Returned Width: {meta.Width}"); }
+            else if (key.Equals(PKEYs.Image_Height)) { pv.SetInt(meta.Height); Log($"  Returned Height: {meta.Height}"); }
+            else if (key.Equals(PKEYs.Image_BitDepth)) { pv.SetInt(Math.Abs(meta.BitPix)); Log($"  Returned BitDepth: {meta.BitPix}"); }
+            else if (key.Equals(PKEYs.Photo_Exposure)) { pv.SetDouble(meta.Exposure); Log($"  Returned Exposure: {meta.Exposure}"); }
+            else { Log("  Returned EMPTY"); }
+            
+            return 0;
+        }
+
+        public uint SetValue(ref PropertyKey key, ref PropVariant pv) => 0x80030001; // STG_E_ACCESSDENIED
+        public uint Commit() => 0;
+
         #region Registration Logic
 
         [ComRegisterFunction]
@@ -385,14 +531,32 @@ namespace FitsPreviewHandler
                     Log("  Configuration keys created in HKLM", true);
                 } catch (Exception ex) { Log("  WARNING: Could not create HKLM config keys: " + ex.Message, true); }
 
-                // 1. .fits -> PerceivedType = image
+                // 1. .fits -> PerceivedType = image, FullDetails, and InfoTip
                 using (RegistryKey key = Registry.ClassesRoot.CreateSubKey(".fits"))
                 {
                     key.SetValue("PerceivedType", "image");
                 }
 
-                // 2. .fits -> ShellEx -> {8895b1c6-b41f-4c1c-a562-0d564250836f} = our CLSID
+                using (RegistryKey key = Registry.LocalMachine.CreateSubKey("SOFTWARE\\Classes\\SystemFileAssociations\\.fits"))
+                {
+                    key.SetValue("FullDetails", "prop:System.PropGroup.Image;System.Image.HorizontalSize;System.Image.VerticalSize;System.Image.BitDepth;System.PropGroup.Camera;System.Photo.CameraModel;System.Photo.ExposureTime;System.PropGroup.Description;System.Subject");
+                    key.SetValue("InfoTip", "prop:System.ItemType;System.Size;System.Subject;System.Photo.CameraModel;System.Photo.ExposureTime");
+                    key.SetValue("PreviewDetails", "prop:*System.Image.HorizontalSize;*System.Image.VerticalSize;*System.Photo.CameraModel;*System.Photo.ExposureTime;*System.Subject");
+                }
+
+                // 2. .fits -> ShellEx -> {8895b1c6-b41f-4c1c-a562-0d564250836f} = Preview Handler CLSID
                 using (RegistryKey key = Registry.ClassesRoot.CreateSubKey(".fits\\ShellEx\\{8895b1c6-b41f-4c1c-a562-0d564250836f}"))
+                {
+                    key.SetValue("", guid);
+                }
+
+                // 2b. .fits -> ShellEx -> {BB2E617C-0920-11d1-9A0B-00C04FC2D6C1} = Property Handler CLSID
+                using (RegistryKey key = Registry.ClassesRoot.CreateSubKey(".fits\\ShellEx\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}"))
+                {
+                    key.SetValue("", guid);
+                }
+                
+                using (RegistryKey key = Registry.LocalMachine.CreateSubKey("SOFTWARE\\Classes\\SystemFileAssociations\\.fits\\ShellEx\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}"))
                 {
                     key.SetValue("", guid);
                 }
@@ -403,10 +567,18 @@ namespace FitsPreviewHandler
                     key.SetValue(guid, "Fits Preview Handler");
                 }
 
+                // 3b. Register in the official Property Handlers list
+                using (RegistryKey key = Registry.LocalMachine.CreateSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertyHandlers\\.fits"))
+                {
+                    key.SetValue("", guid);
+                }
+
                 // 4. Set AppID for our CLSID (referencing the standard System surrogate)
                 using (RegistryKey key = Registry.ClassesRoot.CreateSubKey("CLSID\\" + guid))
                 {
                     key.SetValue("AppID", appid);
+                    key.DeleteValue("ManualSafeSave", false);
+                    key.DeleteValue("DisableProcessIsolation", false);
                 }
                 
                 Log("  Registration complete OK", true);
@@ -428,12 +600,16 @@ namespace FitsPreviewHandler
 
                 // Remove .fits association
                 Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{8895b1c6-b41f-4c1c-a562-0d564250836f}", false);
+                Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}", false);
 
                 // Remove from PreviewHandlers list
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PreviewHandlers", true))
                 {
                     if (key != null) key.DeleteValue(guid, false);
                 }
+
+                // Remove from PropertyHandlers list
+                Registry.LocalMachine.DeleteSubKeyTree("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertyHandlers\\.fits", false);
 
                 // Clean up AppID reference
                 using (RegistryKey key = Registry.ClassesRoot.OpenSubKey("CLSID\\" + guid, true))
