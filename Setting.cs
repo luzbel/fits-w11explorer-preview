@@ -15,8 +15,16 @@ namespace FitsPreviewHandler
         public const string VAL_ENABLE_LOG = "EnableTracing";
         public const string VAL_SPLITTER_POS = "SplitterDistance";
 
-        public static bool ShowImage => ReadBool(VAL_SHOW_IMAGE, true);
-        public static bool EnableTracing => ReadBool(VAL_ENABLE_LOG, false);
+        public static bool ShowImage
+        {
+            get => ReadBool(VAL_SHOW_IMAGE, true);
+            set => WriteInt(VAL_SHOW_IMAGE, value ? 1 : 0);
+        }
+        public static bool EnableTracing
+        {
+            get => ReadBool(VAL_ENABLE_LOG, false);
+            set => WriteInt(VAL_ENABLE_LOG, value ? 1 : 0);
+        }
 
         public static int SplitterDistance
         {
@@ -90,7 +98,7 @@ namespace FitsPreviewHandler
             return defaultValue;
         }
 
-        private static void WriteInt(string valueName, int value)
+        public static void WriteInt(string valueName, int value)
         {
             try
             {

@@ -306,18 +306,21 @@ namespace FitsPreviewHandler
                 ctxMenu.Items.Clear();
                 bool currentShowImg = Settings.ShowImage;
                 bool currentLogOn = Settings.EnableTracing;
-                string scriptRegPath = "HKCU\\" + Settings.REG_PATH;
 
-                var itemImg = new ToolStripMenuItem(currentShowImg ? "Copiar comando cmd para DESACTIVAR imagen" : "Copiar comando cmd para ACTIVAR imagen");
+                var itemImg = new ToolStripMenuItem(currentShowImg ? "Ocultar imagen (carga más rápida). Solo mostrar metadatos" : "Previsualizar imagen con auto-stretch");
                 itemImg.Click += (sender, args) => {
-                    string cmd = $"reg add \"{scriptRegPath}\" /v {Settings.VAL_SHOW_IMAGE} /t REG_DWORD /d {(currentShowImg ? 0 : 1)} /f";
-                    Clipboard.SetText(cmd);
+                    Settings.ShowImage = !currentShowImg;
+                    _lblImageHint.Text = "¡Guardado! Selecciona otro archivo FITS para previsualizar con la nueva configuración.";
+                    _lblImageHint.ForeColor = Color.FromArgb(180, 255, 180);
+                    _lblImageHint.Visible = true;
                 };
                 
-                var itemLog = new ToolStripMenuItem(currentLogOn ? "Copiar comando cmd para DESACTIVAR logs" : "Copiar comando cmd para ACTIVAR logs");
+                var itemLog = new ToolStripMenuItem(currentLogOn ? "Desactivar trazas (Trace: OFF)" : "Activar trazas para depurar en %USERPROFILE%\\AppData\\LocalLow\\FitsPreviewHandler  (Trace: ON)");
                 itemLog.Click += (sender, args) => {
-                    string cmd = $"reg add \"{scriptRegPath}\" /v {Settings.VAL_ENABLE_LOG} /t REG_DWORD /d {(currentLogOn ? 0 : 1)} /f";
-                    Clipboard.SetText(cmd);
+                    Settings.EnableTracing = !currentLogOn;
+                    _lblImageHint.Text = "¡Guardado! Selecciona otro archivo FITS para aplicar la nueva configuración de trazas.";
+                    _lblImageHint.ForeColor = Color.FromArgb(180, 255, 180);
+                    _lblImageHint.Visible = true;
                 };
 
                 ctxMenu.Items.Add(itemImg);
@@ -412,7 +415,7 @@ namespace FitsPreviewHandler
                     _lblProgress.Visible = false;
                 }
                 
-                _lblImageHint.Text = "Right-Click for configuration options";
+                _lblImageHint.Text = "Right-Click for configuration and copy options";
                 _lblImageHint.Visible = true;
 
                 _lblLogStatus.Text = "Trace: " + (logOn ? "ON" : "OFF");
