@@ -22,5 +22,5 @@ if not exist %REGASM% (
 )
 
 echo Unregistering FitsPreviewHandler.dll using: %REGASM%
-%REGASM% /u "%~dp0bin\Debug\net48\FitsPreviewHandler.dll"
+%REGASM% /u "%~dp0FitsPreviewHandler.dll"
 pause

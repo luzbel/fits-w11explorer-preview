@@ -23,5 +23,5 @@ if not exist %REGASM% (
 )
 
 echo Registering FitsPreviewHandler.dll using: %REGASM%
-%REGASM% /codebase "%~dp0bin\Debug\net48\FitsPreviewHandler.dll"
+%REGASM% /codebase "%~dp0FitsPreviewHandler.dll"
 pause
