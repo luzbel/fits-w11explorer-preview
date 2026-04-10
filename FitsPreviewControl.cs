@@ -1077,6 +1077,14 @@ namespace FitsPreviewHandler
                             g.DrawString(filterLabel, filterFont, filterBrush,
                                 new RectangleF(2, size * 0.72f, size - 4, filterPx * 1.6f), sfCenter);
                     }
+
+                    // File-format tag anchored to the bottom — always visible so the user
+                    // can identify these as FITS files without knowing the colour code.
+                    float fitsPx = Math.Max(5f, size * 0.085f);
+                    using (var fitsFont  = new Font("Segoe UI", fitsPx, FontStyle.Regular, GraphicsUnit.Pixel))
+                    using (var fitsBrush = new SolidBrush(lightBg ? Color.FromArgb(110, 110, 110) : Color.FromArgb(80, 80, 110)))
+                        g.DrawString("FITS", fitsFont, fitsBrush,
+                            new RectangleF(0, size - fitsPx * 2f, size, fitsPx * 2f), sfCenter);
                 }
                 return bmp;
             }

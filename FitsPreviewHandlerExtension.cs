@@ -101,9 +101,11 @@ namespace FitsPreviewHandler
 
     public static class PKEYs
     {
-        public static readonly Guid PSG_SUMMARY = new Guid("F29F85E0-4FF9-1068-AB91-08002B27B3D9");
-        public static readonly Guid PSG_IMAGE   = new Guid("6444048F-4C8B-11D1-8B70-080036B11A03");
-        public static readonly Guid PKEY_Photo  = new Guid("14B81DA1-0135-4D31-96D9-6CBFC9671A99");
+        public static readonly Guid PSG_SUMMARY    = new Guid("F29F85E0-4FF9-1068-AB91-08002B27B3D9");
+        public static readonly Guid PSG_IMAGE      = new Guid("6444048F-4C8B-11D1-8B70-080036B11A03");
+        public static readonly Guid PKEY_Photo     = new Guid("14B81DA1-0135-4D31-96D9-6CBFC9671A99");
+        // System.Category — FMTID_DocSummaryInformation, pid 2
+        public static readonly Guid PSG_DOC_SUMMARY = new Guid("D5CDD502-2E9C-101B-9397-08002B2CF9AE");
 
         public static PropertyKey Subject           = new PropertyKey { fmtid = PSG_SUMMARY, pid = 3 };
         public static PropertyKey Image_Width       = new PropertyKey { fmtid = PSG_IMAGE, pid = 3 };
@@ -111,6 +113,7 @@ namespace FitsPreviewHandler
         public static PropertyKey Image_BitDepth    = new PropertyKey { fmtid = PSG_IMAGE, pid = 7 };
         public static PropertyKey Photo_CameraModel = new PropertyKey { fmtid = PKEY_Photo, pid = 272 };
         public static PropertyKey Photo_Exposure    = new PropertyKey { fmtid = PKEY_Photo, pid = 33434 };
+        public static PropertyKey Category          = new PropertyKey { fmtid = PSG_DOC_SUMMARY, pid = 2 };
     }
 
     [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("fc4801a3-2ba9-11cf-a229-00aa003d7352")]
@@ -539,8 +542,8 @@ namespace FitsPreviewHandler
 
         public uint GetCount(out uint cProps) 
         { 
-            cProps = 6;
-            Log("IPropertyStore.GetCount — returning 6");
+            cProps = 7;
+            Log("IPropertyStore.GetCount — returning 7");
             return 0; // S_OK
         }
 
@@ -553,6 +556,7 @@ namespace FitsPreviewHandler
             else if (iProp == 3) pkey = PKEYs.Image_Width;
             else if (iProp == 4) pkey = PKEYs.Image_Height;
             else if (iProp == 5) pkey = PKEYs.Image_BitDepth;
+            else if (iProp == 6) pkey = PKEYs.Category;
             else { pkey = new PropertyKey(); return 1; /* S_FALSE */ }
             return 0;
         }
@@ -574,6 +578,19 @@ namespace FitsPreviewHandler
             else if (key.Equals(PKEYs.Image_Height)) { pv.SetInt(meta.Height); Log($"  Returned Height: {meta.Height}"); }
             else if (key.Equals(PKEYs.Image_BitDepth)) { pv.SetInt(Math.Abs(meta.BitPix)); Log($"  Returned BitDepth: {meta.BitPix}"); }
             else if (key.Equals(PKEYs.Photo_Exposure)) { pv.SetDouble(meta.Exposure); Log($"  Returned Exposure: {meta.Exposure}"); }
+            else if (key.Equals(PKEYs.Category))
+            {
+                // Normalise raw FITS IMAGETYP values (e.g. "Light Frame", "LIGHT", "light frame")
+                // to consistent short labels so Explorer searching is predictable.
+                string t = (meta.ImageType ?? "").ToLowerInvariant();
+                string cat = t.Contains("light") ? "Light"
+                           : t.Contains("flat")  ? "Flat"
+                           : t.Contains("dark")  ? "Dark"
+                           : t.Contains("bias")  ? "Bias"
+                           : meta.ImageType ?? "";
+                pv.SetString(cat);
+                Log($"  Returned Category: {cat}");
+            }
             else { Log("  Returned EMPTY"); }
             
             return 0;
@@ -619,9 +636,9 @@ namespace FitsPreviewHandler
 
                 using (RegistryKey key = Registry.LocalMachine.CreateSubKey("SOFTWARE\\Classes\\SystemFileAssociations\\.fits"))
                 {
-                    key.SetValue("FullDetails", "prop:System.PropGroup.Image;System.Image.HorizontalSize;System.Image.VerticalSize;System.Image.BitDepth;System.PropGroup.Camera;System.Photo.CameraModel;System.Photo.ExposureTime;System.PropGroup.Description;System.Subject");
-                    key.SetValue("InfoTip", "prop:System.ItemType;System.Size;System.Subject;System.Photo.CameraModel;System.Photo.ExposureTime");
-                    key.SetValue("PreviewDetails", "prop:*System.Image.HorizontalSize;*System.Image.VerticalSize;*System.Photo.CameraModel;*System.Photo.ExposureTime;*System.Subject");
+                    key.SetValue("FullDetails", "prop:System.PropGroup.Image;System.Image.HorizontalSize;System.Image.VerticalSize;System.Image.BitDepth;System.PropGroup.Camera;System.Photo.CameraModel;System.Photo.ExposureTime;System.PropGroup.Description;System.Subject;System.Category");
+                    key.SetValue("InfoTip", "prop:System.ItemType;System.Size;System.Subject;System.Photo.CameraModel;System.Photo.ExposureTime;System.Category");
+                    key.SetValue("PreviewDetails", "prop:*System.Image.HorizontalSize;*System.Image.VerticalSize;*System.Photo.CameraModel;*System.Photo.ExposureTime;*System.Subject;*System.Category");
                 }
 
                 // 2. .fits -> ShellEx -> {8895b1c6-b41f-4c1c-a562-0d564250836f} = Preview Handler CLSID

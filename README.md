@@ -20,7 +20,7 @@
   - **Static Badge mode**: When the image panel is disabled (`ShowImage = 0`) the thumbnail never reads pixel data at all. Instead it renders a colour-coded identification badge:
     - Background and icon encode the frame type (`LIGHT ★` / `DARK ■` / `FLAT ●` / `BIAS ─`).
     - The accent colour encodes the filter (`Hα` = red, `OIII` = cyan, `SII` = orange, `Hβ` = blue, `L/R/G/B` bands = their respective colours).
-    - Both the frame type label and the filter name are printed as text, so the badge is readable without knowing any colour code.
+    - The frame type label, filter name, **and a `FITS` format tag** are always printed as text, so the badge is fully readable without knowing any colour code.
 - **Image Preview**: Renders the main channel content with support for:
   - **Smart Debayering**: 2x2 Downsampling (Binning) for color sensors without grid artifacts.
   - **Adaptive Auto-Stretch**: Dynamic level adjustment based on Median/MAD to reveal faint objects.
@@ -33,15 +33,27 @@
     - `System.Image.BitDepth` (from `BITPIX`)
     - `System.Photo.CameraModel` (from FITS `INSTRUME` or `CAMERA`)
     - `System.Photo.ExposureTime` (from FITS `EXPOSURE` or `EXPTIME`)
+    - `System.Category` (from FITS `IMAGETYP` or `FRAME` — normalised to `Light` / `Dark` / `Flat` / `Bias`)
   - **Display Modes**:
     - **InfoTip Support**: Hover your mouse over any FITS file to instantly view a native tooltip summarizing the camera, dimensions, and subject.
     - **Details Pane**: Press `Alt+Enter` or view the file Properties (Details tab) to see the metadata naturally loaded into the OS. The `register.bat` script configures the layout of these properties (`FullDetails`, `InfoTip`, `PreviewDetails`) in the registry.
   - **Advanced Search in Windows Explorer**:
     Because these files are natively registered, you can use Windows Advanced Query Syntax (AQS) in the Explorer search bar. It is recommended to use the exact `System.` keys to avoid localization issues:
-    - **Exact text match**: `System.Photo.CameraModel:ZWO` or `System.Subject:M31`
-    - **Numeric Ranges (Greater/Less than)**: Filter by exposure boundaries, for example: `System.Photo.ExposureTime:>120` (more than 120s) or `System.Photo.ExposureTime:10..300` (between 10s and 300s).
-    - **Combining Conditions (AND / OR)**: Chain queries using logical operators (must be UPPERCASE).
-      *Example: `System.Photo.CameraModel:"ASI294" AND System.Photo.ExposureTime:>300`*
+    - **Find by frame type** — the most common use case:
+      | Query | Result |
+      | :--- | :--- |
+      | `System.Category:Light` | All light frames |
+      | `System.Category:Dark` | All dark frames |
+      | `System.Category:Flat` | All flat fields |
+      | `System.Category:Bias` | All bias frames |
+    - **Find by camera or object**: `System.Photo.CameraModel:ZWO` · `System.Subject:M31`
+    - **Numeric ranges**: `System.Photo.ExposureTime:>120` (over 120 s) · `System.Photo.ExposureTime:10..300`
+    - **Combining conditions (AND / OR — must be UPPERCASE)**:
+      ```
+      System.Category:Dark AND System.Photo.ExposureTime:>300
+      System.Category:Light AND System.Subject:M31
+      System.Category:Flat AND System.Photo.CameraModel:"ASI2600"
+      ```
 - **Dynamic Layout**: Image on top and metadata table at the bottom with resizable height.
 - **Progressive Streaming**: Displays reading progress over the image area while processing the data stream.
 - **Context Menu Integration**: Right-click anywhere in the preview window to access settings and export options:

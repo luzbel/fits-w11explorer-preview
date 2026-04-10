@@ -20,7 +20,7 @@
   - **Modo Badge Estático**: Cuando el panel de imagen está desactivado (`ShowImage = 0`) la miniatura no lee ningún dato de píxeles. En su lugar dibuja un badge de identificación codificado por color:
     - El fondo e icono codifican el tipo de frame (`LIGHT ★` / `DARK ■` / `FLAT ●` / `BIAS ─`).
     - El color de acento codifica el filtro (`Hα` = rojo, `OIII` = cian, `SII` = naranja, `Hβ` = azul, bandas `L/R/G/B` = sus colores respectivos).
-    - Tanto el tipo de frame como el nombre del filtro se muestran como texto, por lo que el badge es legible sin conocer el código de colores.
+    - El tipo de frame, el nombre del filtro **y la etiqueta de formato `FITS`** se muestran siempre como texto, por lo que el badge es completamente legible sin conocer el código de colores.
 - **Vista Previa de Imagen**: Renderiza el contenido del canal principal con soporte para:
   - **Debayering Inteligente**: Downsampling 2x2 (Binning) para sensores color sin artefactos de rejilla.
   - **Auto-Stretch Adaptativo**: Ajuste dinámico de niveles basado en Mediana/MAD para ver objetos débiles.
@@ -33,15 +33,27 @@
     - `System.Image.BitDepth` (desde `BITPIX`)
     - `System.Photo.CameraModel` (desde `INSTRUME` o `CAMERA`)
     - `System.Photo.ExposureTime` (desde `EXPOSURE` o `EXPTIME`)
+    - `System.Category` (desde `IMAGETYP` o `FRAME` — normalizado a `Light` / `Dark` / `Flat` / `Bias`)
   - **Visualización en el Sistema**:
     - **InfoTip Nativo**: Mantén el ratón sobre un archivo FITS para ver una tarjeta emergente con el resumen de la captura.
     - **Pestaña Detalles**: Pulsa `Alt+Enter` (o abre Propiedades -> Detalles) para ver los metadatos extraídos. El script de registro configura nativamente la disposición de estos datos (`FullDetails`, `InfoTip`, `PreviewDetails`).
   - **Búsqueda Avanzada en el Explorador de Windows**:
-    Al estar indexados, Windows permite usar su Sintaxis de Consulta Avanzada (AQS) directamente en la barra de búsqueda superior derecha del Explorador. Como los nombres localizados ("cámara", "exposición") pueden variar, **es recomendable usar el nombre del sistema (`System.*`)**:
-    - **Búsqueda exacta o texto**: `System.Photo.CameraModel:ZWO` o `System.Subject:M31`
-    - **Filtros numéricos y rangos**: Filtra tiempos de exposición usando matemáticas. Ejemplo: `System.Photo.ExposureTime:>120` (más de 120s), o un rango `System.Photo.ExposureTime:10..300` (entre 10 y 300 segundos).
-    - **Combinando Condiciones (AND / OR)**: Usa lógica booleana encadenada (siempre en MAYÚSCULAS). 
-      *Ejemplo: `System.Photo.CameraModel:"QHY" AND System.Photo.ExposureTime:>120` (Cámara QHY y tomas de más de 2 minutos).*
+    Al estar indexados, Windows permite usar su Sintaxis de Consulta Avanzada (AQS) directamente en la barra de búsqueda del Explorador. Usa siempre el nombre del sistema (`System.*`) para evitar problemas de localización:
+    - **Buscar por tipo de frame** — el caso de uso más habitual:
+      | Consulta | Resultado |
+      | :--- | :--- |
+      | `System.Category:Light` | Todos los frames de luz |
+      | `System.Category:Dark` | Todos los darks |
+      | `System.Category:Flat` | Todos los flats |
+      | `System.Category:Bias` | Todos los bias |
+    - **Por cámara u objeto**: `System.Photo.CameraModel:ZWO` · `System.Subject:M31`
+    - **Rangos numéricos**: `System.Photo.ExposureTime:>120` (más de 120 s) · `System.Photo.ExposureTime:10..300`
+    - **Combinando condiciones (AND / OR — siempre en MAYÚSCULAS)**:
+      ```
+      System.Category:Dark AND System.Photo.ExposureTime:>300
+      System.Category:Light AND System.Subject:M31
+      System.Category:Flat AND System.Photo.CameraModel:"ASI2600"
+      ```
 - **Layout Dinámico**: Imagen arriba y tabla de datos abajo con altura redimensionable.
 - **Streaming Progresivo**: Muestra el progreso de lectura centrado sobre la imagen mientras se procesa el flujo de datos.
 - **Menú Contextual Integrado**: Haz clic derecho en cualquier lugar de la vista previa para configurar y exportar:
