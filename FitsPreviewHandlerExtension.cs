@@ -120,10 +120,23 @@ namespace FitsPreviewHandler
         void GetSite(ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppvSite);
     }
 
+    /// <summary>Alpha channel type reported back by <see cref="IThumbnailProvider.GetThumbnail"/>.</summary>
+    public enum WTS_ALPHATYPE : int { WTSAT_UNKNOWN = 0, WTSAT_RGB = 1, WTSAT_ARGB = 2 }
+
+    /// <summary>
+    /// Shell thumbnail provider interface (IID {e357fccd-a995-4576-b01f-234630154e96}).
+    /// Windows calls GetThumbnail on a worker thread; no STA/WinForms objects may be created here.
+    /// </summary>
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("e357fccd-a995-4576-b01f-234630154e96")]
+    public interface IThumbnailProvider
+    {
+        void GetThumbnail(uint cx, out IntPtr hbmp, out WTS_ALPHATYPE pdwAlpha);
+    }
+
     [ComVisible(true)]
     [Guid("AF1C3D6A-81E9-4F5B-9A8C-2D9E71F04B3E")]
     [ClassInterface(ClassInterfaceType.None)]
-    public class FitsPreviewHandlerExtension : IPreviewHandler, IInitializeWithFile, IInitializeWithStream, IInitializeWithItem, IObjectWithSite, IPropertyStore
+    public class FitsPreviewHandlerExtension : IPreviewHandler, IInitializeWithFile, IInitializeWithStream, IInitializeWithItem, IObjectWithSite, IPropertyStore, IThumbnailProvider
     {
         private string _filePath;
         private IntPtr _parentHwnd;
@@ -428,6 +441,73 @@ namespace FitsPreviewHandler
         public void SetSite(object pUnkSite) { _site = pUnkSite; }
         public void GetSite(ref Guid riid, out object ppvSite) { ppvSite = _site; }
 
+        // ── IThumbnailProvider Implementation ────────────────────────────
+        public void GetThumbnail(uint cx, out IntPtr hbmp, out WTS_ALPHATYPE pdwAlpha)
+        {
+            hbmp     = IntPtr.Zero;
+            pdwAlpha = WTS_ALPHATYPE.WTSAT_RGB;
+            Log($"IThumbnailProvider.GetThumbnail — cx={cx}");
+
+            Stream streamToUse   = null;
+            bool   shouldDispose = false;
+            System.Drawing.Bitmap bmp = null;
+            try
+            {
+                // Resolve stream: prefer the COM IStream already handed to us,
+                // fall back to opening the file path directly.
+                if (_stream != null)
+                    streamToUse = _stream;
+                else if (!string.IsNullOrEmpty(_filePath))
+                {
+                    streamToUse   = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    shouldDispose = true;
+                }
+
+                if (streamToUse == null)
+                {
+                    Log("GetThumbnail — no stream or path available");
+                    return;
+                }
+
+                // Step 1: parse the FITS header only (reads until END; typically a few KB).
+                // ParseFitsStream seeks to 0 internally, so stream position doesn't matter.
+                var (_, info) = FitsPreviewControl.ParseFitsStream(streamToUse);
+                _metadata = info; // opportunistic cache for concurrent IPropertyStore queries
+
+                int size = (int)Math.Max(cx, 32);
+
+                // Step 2: render either a real (stride-sampled) thumbnail or a static badge.
+                if (Settings.ShowImage && info.HasImage)
+                {
+                    // Stride: e.g. 4656-wide sensor at cx=256 → stride≈18 → reads ~1/324 of the data.
+                    Log($"GetThumbnail — stride-sampled render to {size}\u00d7{size}");
+                    bmp = FitsPreviewControl.RenderThumbnail(streamToUse, info, size);
+                }
+                else
+                {
+                    // Static badge: zero pixel data read — header metadata only.
+                    Log($"GetThumbnail — static badge (ShowImage={Settings.ShowImage}, HasImage={info.HasImage})");
+                    bmp = FitsPreviewControl.RenderStaticBadge(info, size);
+                }
+
+                if (bmp != null)
+                {
+                    // Shell owns this HBITMAP and will free it via DeleteObject when done.
+                    hbmp = bmp.GetHbitmap(System.Drawing.Color.Black);
+                    Log($"GetThumbnail — success hbmp=0x{hbmp:X}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("GetThumbnail — EXCEPTION: " + ex);
+            }
+            finally
+            {
+                bmp?.Dispose();
+                if (shouldDispose) streamToUse?.Dispose();
+            }
+        }
+
         // ── IPropertyStore Implementation ───────────────────────────────
         private ImageInfo? GetMetadata()
         {
@@ -561,6 +641,16 @@ namespace FitsPreviewHandler
                     key.SetValue("", guid);
                 }
 
+                // 2c. .fits -> ShellEx -> {e357fccd-...} = Thumbnail Provider CLSID
+                using (RegistryKey key = Registry.ClassesRoot.CreateSubKey(".fits\\ShellEx\\{e357fccd-a995-4576-b01f-234630154e96}"))
+                {
+                    key.SetValue("", guid);
+                }
+                using (RegistryKey key = Registry.LocalMachine.CreateSubKey("SOFTWARE\\Classes\\SystemFileAssociations\\.fits\\ShellEx\\{e357fccd-a995-4576-b01f-234630154e96}"))
+                {
+                    key.SetValue("", guid);
+                }
+
                 // 3. Register in the official Preview Handlers list
                 using (RegistryKey key = Registry.LocalMachine.CreateSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PreviewHandlers"))
                 {
@@ -601,6 +691,7 @@ namespace FitsPreviewHandler
                 // Remove .fits association
                 Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{8895b1c6-b41f-4c1c-a562-0d564250836f}", false);
                 Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}", false);
+                Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{e357fccd-a995-4576-b01f-234630154e96}", false);
 
                 // Remove from PreviewHandlers list
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PreviewHandlers", true))

@@ -12,8 +12,16 @@
 
 ## ✨ Características Principales
 
-- **Arquitectura Zero-Copy**: Lee archivos FITS de varios GB de forma instantánea sin copiarlos a disco, usando flujos directos (`IStream`).
-- **Previsualización de Imagen**: Renderiza el contenido del canal principal con soporte para:
+- **Arquitectura Zero-Copy**: Lee archivos FITS de varios GB instantáneamente sin copias en disco, usando streams directos (`IStream`).
+- **Proveedor de Miniaturas**: Genera miniaturas nativas en el Explorador de Windows para archivos `.fits`:
+  - **Stride Sampling**: Solo lee la fracción de píxeles necesaria para rellenar el tamaño de miniatura solicitado. Para un sensor de 4656×3520 a 256 px el stride es ≈18, por lo que únicamente se lee ~1/324 de los datos de píxeles.
+  - **No bloquea el Explorador**: El Shell invoca `GetThumbnail` en un hilo de fondo por cada archivo, en paralelo para toda una carpeta, sin interferir con la UI del Explorador.
+  - **Caché del Shell**: Las miniaturas se cachean automáticamente en `%LOCALAPPDATA%\Microsoft\Windows\Explorer\thumbcache_*.db` — el SO solo regenera una miniatura si el archivo cambia.
+  - **Modo Badge Estático**: Cuando el panel de imagen está desactivado (`ShowImage = 0`) la miniatura no lee ningún dato de píxeles. En su lugar dibuja un badge de identificación codificado por color:
+    - El fondo e icono codifican el tipo de frame (`LIGHT ★` / `DARK ■` / `FLAT ●` / `BIAS ─`).
+    - El color de acento codifica el filtro (`Hα` = rojo, `OIII` = cian, `SII` = naranja, `Hβ` = azul, bandas `L/R/G/B` = sus colores respectivos).
+    - Tanto el tipo de frame como el nombre del filtro se muestran como texto, por lo que el badge es legible sin conocer el código de colores.
+- **Vista Previa de Imagen**: Renderiza el contenido del canal principal con soporte para:
   - **Debayering Inteligente**: Downsampling 2x2 (Binning) para sensores color sin artefactos de rejilla.
   - **Auto-Stretch Adaptativo**: Ajuste dinámico de niveles basado en Mediana/MAD para ver objetos débiles.
   - **Tintado por Filtro**: Colorea automáticamente tomas de banda estrecha (Ha, OIII, SII) según el header.
@@ -57,8 +65,8 @@ Para automatizaciones o despliegues, las claves de registro se almacenan de form
 
 | Valor (DWORD) | Descripción |
 | :--- | :--- |
-| `ShowImage` | `1` (Mostrar imagen y tabla), `0` (Solo tabla). |
-| `EnableTracing` | `1` (Habilitar logs de depuración), `0` (Deshabilitar). |
+| `ShowImage` | `1` (Muestra imagen y tabla + miniatura real con píxeles), `0` (Solo tabla + miniatura badge estático). |
+| `EnableTracing` | `1` (Activa logs de depuración), `0` (Desactiva). |
 
 ---
 

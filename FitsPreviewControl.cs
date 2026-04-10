@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Drawing.Text;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -33,6 +35,7 @@ namespace FitsPreviewHandler
         public string DateObs;
         public double Exposure;
         public string Software;
+        public string ImageType;   // IMAGETYP or FRAME keyword (e.g. Light Frame / Dark Frame / Flat Field / Bias Frame)
 
         public int  BytesPerPixel => Math.Abs(BitPix) / 8;
         public override string ToString() =>
@@ -526,9 +529,9 @@ namespace FitsPreviewHandler
         }
 
         // ── Rendering pipeline ──────────────────────────────────────────
-        private static Bitmap RenderImage(Stream stream, ImageInfo info, System.Threading.CancellationToken token, Action<string> reportProgress = null)
+        private static Bitmap RenderImage(Stream stream, ImageInfo info, System.Threading.CancellationToken token, Action<string> reportProgress = null, int maxDim = 2000)
         {
-            const int MAX_DIM = 2000; // Increased max dim for better resolution in large layouts
+            int MAX_DIM = maxDim; // Default 2000 for the preview panel; pass cx for thumbnail generation
             double aspect = (double)info.Width / info.Height;
             int outW, outH;
             if (info.Width >= info.Height)
@@ -934,6 +937,9 @@ namespace FitsPreviewHandler
                                 case "CREATOR":
                                 case "PROGRAM": info.Software = val; break;
                                 case "CAMERA": info.Camera = val; break;
+                                case "IMAGETYP":
+                                case "FRAME":
+                                    if (info.ImageType == null) info.ImageType = val.Trim(); break;
                             }
                         }
                         else
@@ -984,6 +990,133 @@ namespace FitsPreviewHandler
                 if (sl >= 0) { value = area.Substring(0, sl).Trim(); comment = area.Substring(sl + 1).Trim(); }
                 else           value = area.Trim();
             }
+        }
+
+        // ── Thumbnail & Badge rendering (called by IThumbnailProvider) ─────────
+
+        /// <summary>
+        /// Renders a stride-sampled thumbnail fitting within <paramref name="cx"/>×<paramref name="cx"/> pixels.
+        /// For a 4656-wide sensor at cx=256 the stride is ~18, so only ≈1/324th of the pixel
+        /// data is read — the rest of the file is never touched.
+        /// </summary>
+        internal static Bitmap RenderThumbnail(Stream stream, ImageInfo info, int cx)
+            => RenderImage(stream, info, System.Threading.CancellationToken.None, null, cx);
+
+        /// <summary>
+        /// Renders a static identification badge when image rendering is disabled (ShowImage=false).
+        /// Encodes the frame type (LIGHT/DARK/FLAT/BIAS) via background colour and icon,
+        /// and the FILTER keyword via an accent colour + text label.
+        /// Zero pixel data is read — uses only the already-parsed <see cref="ImageInfo"/> metadata.
+        /// </summary>
+        internal static Bitmap RenderStaticBadge(ImageInfo info, int size)
+        {
+            string typeRaw = (info.ImageType ?? string.Empty).ToLowerInvariant().Trim();
+
+            string frameLabel;
+            Color  bgColor;
+            string iconChar;
+            bool   lightBg; // true for FLAT (bright bg → use dark ink)
+
+            if      (typeRaw.Contains("light")) { frameLabel = "LIGHT"; bgColor = Color.FromArgb( 13,  13,  26); iconChar = "\u2605"; lightBg = false; } // ★
+            else if (typeRaw.Contains("flat"))  { frameLabel = "FLAT";  bgColor = Color.FromArgb(200, 200, 200); iconChar = "\u25cf"; lightBg = true;  } // ●
+            else if (typeRaw.Contains("dark"))  { frameLabel = "DARK";  bgColor = Color.FromArgb( 26,  10,  10); iconChar = "\u25a0"; lightBg = false; } // ■
+            else if (typeRaw.Contains("bias"))  { frameLabel = "BIAS";  bgColor = Color.FromArgb( 10,  10,  20); iconChar = "\u2015"; lightBg = false; } // ―
+            else                                { frameLabel = "FITS";  bgColor = Color.FromArgb( 17,  17,  34); iconChar = "?";      lightBg = false; }
+
+            Color accentColor = GetFilterAccentColor(info.Filter);
+            Color inkColor    = lightBg ? Color.FromArgb( 40,  40,  40) : Color.FromArgb(220, 220, 235);
+            Color iconColor   = lightBg ? Color.FromArgb( 80,  80,  80) : accentColor;
+
+            // Clamp filter label to 10 chars to avoid overflow at small sizes
+            string filterLabel = string.IsNullOrEmpty(info.Filter) ? ""
+                : (info.Filter.Length > 10 ? info.Filter.Substring(0, 10) : info.Filter);
+
+            var bmp = new Bitmap(size, size, PixelFormat.Format24bppRgb);
+            try
+            {
+                using (var g = Graphics.FromImage(bmp))
+                using (var sfCenter = new StringFormat {
+                    Alignment     = StringAlignment.Center,
+                    LineAlignment = StringAlignment.Center,
+                    Trimming      = StringTrimming.EllipsisCharacter
+                })
+                {
+                    g.SmoothingMode     = SmoothingMode.AntiAlias;
+                    g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                    g.Clear(bgColor);
+
+                    // Accent stripe at the top (1/12 of height, min 4 px)
+                    int stripeH = Math.Max(4, size / 12);
+                    using (var sb = new SolidBrush(accentColor))
+                        g.FillRectangle(sb, 0, 0, size, stripeH);
+
+                    // Inset border, accent-coloured
+                    using (var pen = new Pen(Color.FromArgb(180, accentColor.R, accentColor.G, accentColor.B), 1.5f))
+                        g.DrawRectangle(pen, 1, 1, size - 3, size - 3);
+
+                    // Icon centred in the upper ~44 % below the stripe
+                    float iconPx = Math.Max(8f, size * 0.30f);
+                    using (var iconFont  = new Font("Segoe UI Symbol", iconPx, FontStyle.Regular, GraphicsUnit.Pixel))
+                    using (var iconBrush = new SolidBrush(iconColor))
+                        g.DrawString(iconChar, iconFont, iconBrush,
+                            new RectangleF(0, stripeH, size, size * 0.44f), sfCenter);
+
+                    // Frame-type label (bold)
+                    float labelPx = Math.Max(7f, size * 0.13f);
+                    using (var labelFont  = new Font("Segoe UI", labelPx, FontStyle.Bold,    GraphicsUnit.Pixel))
+                    using (var labelBrush = new SolidBrush(inkColor))
+                        g.DrawString(frameLabel, labelFont, labelBrush,
+                            new RectangleF(2, size * 0.55f, size - 4, labelPx * 1.6f), sfCenter);
+
+                    // Filter label (regular, accent colour)
+                    if (!string.IsNullOrEmpty(filterLabel))
+                    {
+                        float filterPx = Math.Max(6f, size * 0.11f);
+                        using (var filterFont  = new Font("Segoe UI", filterPx, FontStyle.Regular, GraphicsUnit.Pixel))
+                        using (var filterBrush = new SolidBrush(accentColor))
+                            g.DrawString(filterLabel, filterFont, filterBrush,
+                                new RectangleF(2, size * 0.72f, size - 4, filterPx * 1.6f), sfCenter);
+                    }
+                }
+                return bmp;
+            }
+            catch
+            {
+                bmp?.Dispose();
+                return null;
+            }
+        }
+
+        /// <summary>Maps a FITS FILTER keyword value to a badge accent colour.</summary>
+        private static Color GetFilterAccentColor(string filter)
+        {
+            if (string.IsNullOrEmpty(filter)) return Color.FromArgb(136, 136, 187);
+            string f = filter.ToLowerInvariant().Trim();
+
+            // Narrowband emission lines — check most specific tokens first
+            if (f == "ha" || f == "h-a" || f == "h\u03b1" ||
+                f.StartsWith("halpha") || f.Contains("h-alpha") || f.Contains("h_alpha"))
+                return Color.FromArgb(255,  60,  60);
+            if (f.Contains("oiii") || f == "o3" || f.Contains("o-iii") || f.Contains("o_iii"))
+                return Color.FromArgb( 60, 240, 240);
+            if (f.Contains("sii")  || f == "s2" || f.Contains("s-ii")  || f.Contains("s_ii"))
+                return Color.FromArgb(255, 128,  32);
+            if (f == "hb" || f == "h-b" || f == "h\u03b2" ||
+                f.StartsWith("hbeta") || f.Contains("h-beta") || f.Contains("h_beta"))
+                return Color.FromArgb( 80,  80, 255);
+
+            // Broadband LRGB
+            if (f == "l" || f == "lum" || f == "luminance" || f.StartsWith("lum"))
+                return Color.FromArgb(220, 220, 220);
+            if (f == "r" || f == "red")
+                return Color.FromArgb(255,  50,  50);
+            if (f == "g" || f == "green" || f == "grn")
+                return Color.FromArgb( 60, 220,  60);
+            if (f == "b" || f == "blue" || f == "blu")
+                return Color.FromArgb( 60, 100, 255);
+
+            // Unknown filter → neutral purple-grey
+            return Color.FromArgb(136, 136, 187);
         }
 
         public void ShowError(string message)

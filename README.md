@@ -13,6 +13,14 @@
 ## ✨ Main Features
 
 - **Zero-Copy Architecture**: Reads multi-GB FITS files instantly without copying to disk, using direct streams (`IStream`).
+- **Thumbnail Provider**: Generates native Windows Explorer thumbnails for `.fits` files:
+  - **Stride Sampling**: Only reads the fraction of pixels needed to fill the requested thumbnail size. For a 4656×3520 sensor at 256 px the stride is ≈18, so only ~1/324th of the pixel data is ever read.
+  - **Non-Blocking**: The Shell calls `GetThumbnail` on a background thread per file, in parallel across a whole folder, while the Explorer UI stays responsive.
+  - **Shell Cache**: Thumbnails are cached automatically in `%LOCALAPPDATA%\Microsoft\Windows\Explorer\thumbcache_*.db` by the OS — regeneration only happens when the file changes.
+  - **Static Badge mode**: When the image panel is disabled (`ShowImage = 0`) the thumbnail never reads pixel data at all. Instead it renders a colour-coded identification badge:
+    - Background and icon encode the frame type (`LIGHT ★` / `DARK ■` / `FLAT ●` / `BIAS ─`).
+    - The accent colour encodes the filter (`Hα` = red, `OIII` = cyan, `SII` = orange, `Hβ` = blue, `L/R/G/B` bands = their respective colours).
+    - Both the frame type label and the filter name are printed as text, so the badge is readable without knowing any colour code.
 - **Image Preview**: Renders the main channel content with support for:
   - **Smart Debayering**: 2x2 Downsampling (Binning) for color sensors without grid artifacts.
   - **Adaptive Auto-Stretch**: Dynamic level adjustment based on Median/MAD to reveal faint objects.
@@ -57,7 +65,7 @@ However, if you want to automate deployment, you can edit the Windows Registry. 
 
 | Value (DWORD) | Description |
 | :--- | :--- |
-| `ShowImage` | `1` (Show image and table), `0` (Table only). |
+| `ShowImage` | `1` (Show image and table + real pixel thumbnail), `0` (Table only + static badge thumbnail). |
 | `EnableTracing` | `1` (Enable debug logs), `0` (Disable). |
 
 ---
