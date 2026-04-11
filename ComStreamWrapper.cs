@@ -7,27 +7,29 @@ namespace FitsPreviewHandler
 {
     /// <summary>
     /// A .NET Stream wrapper for the COM IStream interface.
-    /// This allows us to read FITS data directly from the Shell without copying to a disk file.
+    /// Dispose() releases the COM reference via Marshal.ReleaseComObject so the
+    /// shell can free the underlying Win32 file handle promptly.
     /// </summary>
     public class ComStreamWrapper : Stream
     {
-        private readonly IStream _source;
+        private IStream _source;
+        private bool _disposed;
 
         public ComStreamWrapper(IStream source)
         {
             _source = source ?? throw new ArgumentNullException(nameof(source));
         }
 
-        public override bool CanRead => true;
-        public override bool CanSeek => true;
+        public override bool CanRead  => !_disposed;
+        public override bool CanSeek  => !_disposed;
         public override bool CanWrite => false;
 
         public override long Length
         {
             get
             {
-                System.Runtime.InteropServices.ComTypes.STATSTG stat;
-                _source.Stat(out stat, 1); // STATFLAG_NONAME = 1
+                if (_disposed) throw new ObjectDisposedException(nameof(ComStreamWrapper));
+                _source.Stat(out System.Runtime.InteropServices.ComTypes.STATSTG stat, 1); // STATFLAG_NONAME = 1
                 return stat.cbSize;
             }
         }
@@ -42,10 +44,9 @@ namespace FitsPreviewHandler
 
         public override int Read(byte[] buffer, int offset, int count)
         {
-            // Note: IStream.Read starts at the current pointer position.
-            // We assume offset is 0 for simplicity in this bridge.
+            if (_disposed) throw new ObjectDisposedException(nameof(ComStreamWrapper));
             if (offset != 0) throw new NotSupportedException("Only 0 offset supported for ComStream bridge");
-            
+
             IntPtr bytesReadPtr = Marshal.AllocCoTaskMem(sizeof(int));
             try
             {
@@ -60,6 +61,7 @@ namespace FitsPreviewHandler
 
         public override long Seek(long offset, SeekOrigin origin)
         {
+            if (_disposed) throw new ObjectDisposedException(nameof(ComStreamWrapper));
             IntPtr posPtr = Marshal.AllocCoTaskMem(sizeof(long));
             try
             {
@@ -72,13 +74,22 @@ namespace FitsPreviewHandler
             }
         }
 
-        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void SetLength(long value)  => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 
         protected override void Dispose(bool disposing)
         {
-            // We do NOT dispose the _source IStream here because the Windows Shell owns its lifecycle.
-            // The shell will release the COM object when the preview is unloaded.
+            if (!_disposed)
+            {
+                _disposed = true;
+                if (_source != null)
+                {
+                    // Release our COM reference so the shell's IStream ref-count can reach
+                    // zero and the underlying Win32 file handle can be closed immediately.
+                    try { Marshal.ReleaseComObject(_source); } catch { }
+                    _source = null;
+                }
+            }
             base.Dispose(disposing);
         }
     }

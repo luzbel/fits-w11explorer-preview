@@ -194,8 +194,24 @@ namespace FitsPreviewHandler
             {
                 if (pstream is System.Runtime.InteropServices.ComTypes.IStream comStream)
                 {
-                    Log($"IInitializeWithStream.Initialize — ready for Zero-Copy");
-                    _stream = new ComStreamWrapper(comStream);
+                    // Copy the COM IStream into a MemoryStream immediately and release the COM reference.
+                    // Rationale: the shell owns the IStream and holds the underlying Win32 file handle
+                    // using whatever sharing flags it chose (typically without FILE_SHARE_DELETE).
+                    // If we keep a live reference to it, the shell cannot release its file handle until
+                    // it decides to — blocking folder renames even after Unload() returns.
+                    // By draining into RAM now we give the shell back full control of the file handle.
+                    Log("IInitializeWithStream.Initialize — copying COM IStream to MemoryStream");
+                    var ms = new MemoryStream();
+                    var wrapper = new ComStreamWrapper(comStream);
+                    wrapper.Seek(0, System.IO.SeekOrigin.Begin);
+                    wrapper.CopyTo(ms);
+                    // wrapper holds no native resources (Dispose is a no-op), but tidy up anyway.
+                    wrapper.Dispose();
+                    // Release the COM reference explicitly so the shell can free its file handle now.
+                    System.Runtime.InteropServices.Marshal.ReleaseComObject(comStream);
+                    ms.Position = 0;
+                    _stream = ms;
+                    Log($"IInitializeWithStream.Initialize — MemoryStream ready ({ms.Length} bytes), COM IStream released");
                 }
                 else
                 {
@@ -394,27 +410,56 @@ namespace FitsPreviewHandler
         public void Unload()
         {
             Log("Unload — called");
+
+            var threadToJoin = _uiThread;   // capture before clearing
+            _uiThread = null;
+
             if (_control != null && _control.IsHandleCreated)
             {
                 Log("Unload — disposing control and exiting UI thread message loop");
                 var controlToDispose = _control;
-                controlToDispose.BeginInvoke(new Action(() =>
-                {
-                    try
-                    {
-                        controlToDispose.Dispose();
-                        Application.ExitThread();
-                        Log("Unload — Application.ExitThread called inside UI thread");
-                    }
-                    catch (Exception ex) { Log("Unload — EXCEPTION during dispose: " + ex); }
-                }));
                 _control = null;
+
+                // Signal when the UI thread has actually finished ExitThread
+                var done = new System.Threading.ManualResetEventSlim(false);
+
+                try
+                {
+                    controlToDispose.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            controlToDispose.Dispose();
+                            Application.ExitThread();
+                            Log("Unload — Application.ExitThread called inside UI thread");
+                        }
+                        catch (Exception ex) { Log("Unload — EXCEPTION during dispose: " + ex); }
+                        finally { done.Set(); }
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    Log("Unload — BeginInvoke failed: " + ex.Message);
+                    done.Set(); // don't block forever if BeginInvoke itself throws
+                }
+
+                Log("Unload — waiting for UI thread to finish (max 3 s)...");
+                bool finished = done.Wait(3000);
+                Log($"Unload — wait completed (finished={finished})");
             }
             else
             {
                 Log("Unload — control was null or handle not created");
             }
-            _uiThread = null;
+
+            // Join the UI thread so its STA pump is guaranteed dead before we return
+            if (threadToJoin != null && threadToJoin.IsAlive)
+            {
+                Log("Unload — joining UI thread...");
+                bool joined = threadToJoin.Join(2000);
+                Log($"Unload — thread join result: {joined}");
+            }
+
             Log("Unload — cleaning up");
             if (_stream != null)
             {
@@ -462,7 +507,8 @@ namespace FitsPreviewHandler
                     streamToUse = _stream;
                 else if (!string.IsNullOrEmpty(_filePath))
                 {
-                    streamToUse   = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    // FileShare.Delete lets the parent folder be renamed while this handle is open.
+                    streamToUse   = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                     shouldDispose = true;
                 }
 
@@ -523,7 +569,8 @@ namespace FitsPreviewHandler
                 streamToParse = _stream;
             else if (!string.IsNullOrEmpty(_filePath))
             {
-                streamToParse = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                // FileShare.Delete lets the parent folder be renamed while this handle is open.
+                streamToParse = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                 shouldDispose = true;
             }
 

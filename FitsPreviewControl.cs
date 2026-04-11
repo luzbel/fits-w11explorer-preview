@@ -93,6 +93,7 @@ namespace FitsPreviewHandler
 
         // ── Concurrency ─────────────────────────────────────────────────
         private System.Threading.CancellationTokenSource _cts;
+	private Task _imageLoadTask;
         private readonly object _syncRoot = new object();
 
         private void CancelOldLoad()
@@ -102,7 +103,8 @@ namespace FitsPreviewHandler
                 if (_cts != null)
                 {
                     _cts.Cancel();
-                    _cts.Dispose();
+                    //_cts.Dispose();
+		    // NO dispose aquí, se hará en Dispose tras esperar a la tarea
                     _cts = null;
                 }
                 _cts = new System.Threading.CancellationTokenSource();
@@ -114,6 +116,40 @@ namespace FitsPreviewHandler
             Log("FitsPreviewControl.ctor");
             try   { InitializeComponent(); Log("ctor — OK"); }
             catch (Exception ex) { Log("ctor — EXCEPTION: " + ex); throw; }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                Log("FitsPreviewControl.Dispose — cancelling async tasks");
+                lock (_syncRoot)
+                {
+                    if (_cts != null)
+                    {
+                        _cts.Cancel();
+                        _cts.Dispose();
+                        _cts = null;
+                    }
+                }
+
+		// Esperar a que la tarea termine para garantizar que el 
+		// FileStream se haya cerrado antes de devolver el control al Shell
+		_imageLoadTask?.Wait(3000);
+                lock (_syncRoot)
+		{
+                        _cts.Dispose();
+			_cts = null;
+		}
+
+		// Liberar recursos GDI explícitamente (WinForms no lo hace automáticamente)
+		if (_pictureBox.Image != null)
+		{
+			_pictureBox.Image.Dispose();
+			_pictureBox.Image = null;
+		}
+	    }
+            base.Dispose(disposing);
         }
 
         private void InitializeComponent()
@@ -388,10 +424,12 @@ namespace FitsPreviewHandler
                     ShowError(Strings.FileNotFound + filePath);
                     return;
                 }
-                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                {
-                    LoadFits(fs, Path.GetFileName(filePath));
-                }
+                // FileShare.Delete allows the parent folder to be renamed/moved even while
+                // we hold this handle open (async image task may still be reading).
+                // ownsStream=true hands disposal responsibility to LoadFits/StartImageLoad.
+                var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read,
+                                        FileShare.ReadWrite | FileShare.Delete);
+                LoadFits(fs, Path.GetFileName(filePath), ownsStream: true);
             }
             catch (Exception ex)
             {
@@ -400,7 +438,7 @@ namespace FitsPreviewHandler
             }
         }
 
-        public void LoadFits(Stream stream, string fileName)
+        public void LoadFits(Stream stream, string fileName, bool ownsStream = false)
         {
             Log($"LoadFits(Stream) — '{fileName}' length={stream.Length}");
             
@@ -437,7 +475,11 @@ namespace FitsPreviewHandler
                 if (showImg && info.HasImage)
                 {
                     CancelOldLoad();
-                    StartImageLoad(stream, info, _cts.Token);
+                    // Pass ownsStream so the async task disposes it when finished.
+                    // This keeps the stream alive (and the file handle open with
+                    // FileShare.Delete) for the full duration of the render.
+                    StartImageLoad(stream, info, _cts.Token, ownsStream);
+                    ownsStream = false; // task now owns it
                 }
                 else if (!showImg)
                     Log("LoadFits — image loading disabled in registry");
@@ -448,6 +490,14 @@ namespace FitsPreviewHandler
             {
                 Log("LoadFits(Stream) — EXCEPTION: " + ex);
                 ShowError(Strings.ErrorReadingStream + ex.Message);
+            }
+            finally
+            {
+                // Dispose only if the task didn't take ownership (no image, error, etc.)
+                if (ownsStream)
+                {
+                    try { stream.Dispose(); } catch { }
+                }
             }
         }
 
@@ -479,12 +529,13 @@ namespace FitsPreviewHandler
         }
 
         // ── Async image load ────────────────────────────────────────────
-        private void StartImageLoad(Stream stream, ImageInfo info, System.Threading.CancellationToken token)
+        private void StartImageLoad(Stream stream, ImageInfo info, System.Threading.CancellationToken token, bool ownsStream = false)
         {
-            Log($"StartImageLoad — {info.Width}×{info.Height} planes={info.Planes} bitpix={info.BitPix}");
+            Log($"StartImageLoad — {info.Width}×{info.Height} planes={info.Planes} bitpix={info.BitPix} ownsStream={ownsStream}");
 
             if (info.BitPix == 0)
             {
+                if (ownsStream) { try { stream.Dispose(); } catch { } }
                 BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderBitpix0));
                 return;
             }
@@ -493,12 +544,22 @@ namespace FitsPreviewHandler
             long dataBytes = (long)info.Width * info.Height * info.Planes * info.BytesPerPixel;
             if (dataBytes > MAX_BYTES)
             {
+                if (ownsStream) { try { stream.Dispose(); } catch { } }
                 BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderTooLarge(dataBytes/1024/1024)));
                 return;
             }
 
-            Task.Run(() =>
+	    // ← USAR CancellationToken.None para garantizar que el delegate se ejecute
+	    // y el bloque `finally` siempre disponga el stream.
+
+            _imageLoadTask = Task.Run(() =>
             {
+	    	// Si se canceló antes de empezar, asegurar cierre inmediato
+		if (token.IsCancellationRequested && ownsStream) {
+			try { stream.Dispose(); } catch {}
+			return;
+		}
+
                 try
                 {
                     void Report(string msg) => BeginInvoke(new Action(() => {
@@ -511,21 +572,37 @@ namespace FitsPreviewHandler
                     {
                         BeginInvoke(new Action(() =>
                         {
+			    // Liberar imagen anterior para evitar fugas GDI
+			    if (_pictureBox.Image != null) { _pictureBox.Image.Dispose(); _pictureBox.Image = null; }
                             _pictureBox.Image = bmp;
                             _pictureBox.Visible = true;
                             _lblProgress.Visible = false;
                         }));
                     }
+		    else if (bmp != null)
+		    {
+			    bmp.Dispose(); // Cancelado antes de asignar
+		    }
                 }
                 catch (Exception ex)
                 {
                     Log("StartImageLoad — EXCEPTION: " + ex);
-                    BeginInvoke(new Action(() => {
-                        _lblProgress.Text = Strings.RenderError(ex.Message);
-                        _lblProgress.Visible = true;
-                    }));
+                    if (!IsDisposed)
+                        BeginInvoke(new Action(() => {
+                            _lblProgress.Text = Strings.RenderError(ex.Message);
+                            _lblProgress.Visible = true;
+                        }));
                 }
-            }, token);
+                finally
+                {
+                    // Release the file handle as soon as rendering is done (or cancelled/failed)
+                    if (ownsStream)
+                    {
+                        try { stream.Dispose(); } catch { }
+                    }
+                }
+            //}, token);
+            }); // sin token aquí
         }
 
         // ── Rendering pipeline ──────────────────────────────────────────
