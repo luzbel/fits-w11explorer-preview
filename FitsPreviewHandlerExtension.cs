@@ -146,8 +146,31 @@ namespace FitsPreviewHandler
         private RECT _bounds;
         private FitsPreviewControl _control;
         private System.Threading.Thread _uiThread;
-        private Stream _stream; // Direct zero-copy stream
+        // private Stream _stream; // Direct zero-copy stream
+	//private ComStreamWrapper _dataStream; // Wrapper vivo, sin copia a RAM
+	private ComStreamWrapper _stream; // Wrapper vivo, sin copia a RAM
         private ImageInfo? _metadata; // Cached metadata for property store
+	
+
+	// ── Stream Resolution (Zero-Copy + Safe Fallback) ───────────────
+	private Stream ResolveStream(out bool shouldDispose)
+	{
+		shouldDispose = false;
+
+		// 1. Si el Shell nos pasó un IStream, usamos el wrapper vivo (cero copia)
+		if (_stream != null)
+			return _stream;
+
+		// 2. Fallback: abrimos el archivo directamente con FileShare.Delete
+		if (!string.IsNullOrEmpty(_filePath))
+		{
+			shouldDispose = true;
+			return new FileStream(_filePath, FileMode.Open, FileAccess.Read,
+					FileShare.ReadWrite | FileShare.Delete);
+		}
+
+		return null;
+	}
         
         // Shared log writer — delegates to the same path used by FitsPreviewControl
         private static void Log(string msg, bool force = false)
@@ -189,6 +212,7 @@ namespace FitsPreviewHandler
 
         void IInitializeWithStream.Initialize(object pstream, uint grfMode)
         {
+		/*
             Log($"IInitializeWithStream.Initialize — grfMode={grfMode}, stream is {pstream?.GetType().FullName ?? "null"}");
             try
             {
@@ -219,8 +243,35 @@ namespace FitsPreviewHandler
                 }
                 _metadata = null;
             }
-            catch (Exception ex) { Log("IInitializeWithStream EXCEPTION: " + ex); }
-        }
+            catch (Exception ex) { Log("IInitializeWithStream EXCEPTION: " + ex); } */
+
+		Log($"IInitializeWithStream.Initialize — grfMode={grfMode}");
+		try
+		{
+			if (pstream is System.Runtime.InteropServices.ComTypes.IStream comStream)
+			{
+				// ✅ ZERO-COPY: Solo envolvemos. NO copiamos a MemoryStream.
+				_stream = new ComStreamWrapper(comStream);
+				_stream.Seek(0, System.IO.SeekOrigin.Begin);
+
+				// ✅ CABECERA EN MEMORIA: Parseamos solo hasta END (~KB)
+				try
+				{
+					var (_, info) = FitsPreviewControl.ParseFitsStream(_stream);
+					_metadata = info; // Cacheo inmediato para IPropertyStore
+					Log($"IInitializeWithStream — Header parsed. Image: {info.Width}x{info.Height}");
+				}
+				catch (Exception parseEx)
+				{
+					Log($"IInitializeWithStream — Header parse warning: {parseEx.Message}");
+				}
+
+				Log("IInitializeWithStream — COM IStream wrapped (zero-copy, on-demand sampling ready)");
+			}
+		}
+		catch (Exception ex) { Log($"IInitializeWithStream EXCEPTION: {ex}"); }
+
+	}
 
         void IInitializeWithItem.Initialize(object psiObj, uint grfMode)
         {
@@ -255,7 +306,7 @@ namespace FitsPreviewHandler
             _parentHwnd = hwnd;
             _bounds = rect;
         }
-
+/*
         public void SetRect(ref RECT rect)
         {
             Log($"SetRect — rect=[{rect.left},{rect.top},{rect.right},{rect.bottom}]");
@@ -274,7 +325,23 @@ namespace FitsPreviewHandler
             {
                 Log($"SetRect — control not ready yet (_control={(_control == null ? "null" : "non-null")}, HandleCreated={_control?.IsHandleCreated ?? false})");
             }
+        } */
+	    public void SetRect(ref RECT rect)
+    {
+        Log($"SetRect — rect=[{rect.left},{rect.top},{rect.right},{rect.bottom}] ");
+        _bounds = rect;
+
+        var ctrl = _control;
+        if (ctrl != null && ctrl.IsHandleCreated && !ctrl.IsDisposed)
+        {
+            var r = new Rectangle(0, 0, rect.right - rect.left, rect.bottom - rect.top);
+            ctrl.BeginInvoke(new Action(() =>
+            {
+                try { if (!ctrl.IsDisposed) ctrl.Bounds = r; }
+                catch (Exception ex) { Log($"SetRect — EXCEPTION during resize: {ex.Message} "); }
+            }));
         }
+    }
 
         [DllImport("user32.dll")]
         private static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
@@ -294,7 +361,7 @@ namespace FitsPreviewHandler
         private const int GWL_STYLE = -16;
         private const int WS_CHILD = 0x40000000;
         private const int WS_VISIBLE = 0x10000000;
-
+/*
         public void DoPreview()
         {
             Log($"DoPreview — _filePath='{_filePath}' parentHwnd=0x{_parentHwnd:X}");
@@ -367,17 +434,22 @@ namespace FitsPreviewHandler
 
                         _control.Show();
                         Log("UI Thread — control shown");
-
-                        if (_stream != null)
-                        {
-                            Log("UI Thread — loading from direct STREAM");
-                            _control.LoadFits(_stream, "FITS Stream");
-                        }
-                        else if (!string.IsNullOrEmpty(pathToLoad))
-                        {
-                            Log($"UI Thread — loading from PATH: '{pathToLoad}'");
-                            _control.LoadFits(pathToLoad);
-                        }
+//
+ //                       if (_stream != null)
+  //                      {
+   //                         Log("UI Thread — loading from direct STREAM");
+    //                        _control.LoadFits(_stream, "FITS Stream");
+     //                   }
+      //                  else if (!string.IsNullOrEmpty(pathToLoad))
+       //                 {
+        //                    Log($"UI Thread — loading from PATH: '{pathToLoad}'");
+         //                   _control.LoadFits(pathToLoad);
+          //              } 
+			if (_stream!=null) {
+				 Log("UI Thread — loading from direct COM Stream (zero-copy) ");
+				 // ownsStream=false → la extensión es responsable de Dispose() en Unload()
+				_control.LoadFits(_stream, "FITS Stream", ownsStream: false);
+			}
                         else
                         {
                             Log("UI Thread — WARNING: no stream or path to load");
@@ -405,8 +477,117 @@ namespace FitsPreviewHandler
                 if (!signalled) Log("DoPreview — ERROR: UI thread did not signal handle creation in time.");
             }
             catch (Exception ex) { Log("DoPreview — EXCEPTION: " + ex); }
-        }
+        } */
 
+        public void DoPreview()
+    {
+        Log($"DoPreview — _filePath='{_filePath}' parentHwnd=0x{_parentHwnd:X} ");
+        Log($"DoPreview — bounds=[{_bounds.left},{_bounds.top},{_bounds.right},{_bounds.bottom}] ");
+        try
+        {
+            if (_uiThread != null && _uiThread.IsAlive)
+            {
+                Log("DoPreview — UI thread already running, skipping ");
+                return;
+            }
+
+            string pathToLoad = _filePath;
+            IntPtr parentHost = _parentHwnd;
+
+            if (_bounds.right - _bounds.left <= 0 || _bounds.bottom - _bounds.top <= 0)
+            {
+                Log("DoPreview — _bounds is empty! Getting client rect from parent. ");
+                if (GetClientRect(parentHost, out RECT parentRect))
+                {
+                    _bounds = parentRect;
+                    Log($"DoPreview — GetClientRect(parent) → [{_bounds.left},{_bounds.top},{_bounds.right},{_bounds.bottom}] ");
+                }
+            }
+
+            Rectangle initialBounds = new Rectangle(
+                _bounds.left, _bounds.top,
+                _bounds.right - _bounds.left,
+                _bounds.bottom - _bounds.top);
+
+            Log($"DoPreview — final initialBounds={initialBounds} ");
+            var ready = new System.Threading.ManualResetEventSlim(false);
+
+            _uiThread = new System.Threading.Thread(() =>
+            {
+                Log("UI Thread — started ");
+                try
+                {
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    Log("UI Thread — Application styles set ");
+
+                    // ✅ CRÍTICO: Variable local para aislar el control de Unload()
+                    var localControl = new FitsPreviewControl();
+                    _control = localControl; // Asignar al campo para que SetRect/Unload lo encuentren
+                    localControl.Bounds = initialBounds;
+                    Log($"UI Thread — FitsPreviewControl created, bounds={localControl.Bounds} ");
+
+                    var hwndControl = localControl.Handle;
+                    Log($"UI Thread — HWND created: 0x{hwndControl:X} ");
+                    ready.Set();
+
+                    var prevParent = SetParent(hwndControl, parentHost);
+                    Log($"UI Thread — SetParent → prevParent=0x{prevParent:X} ");
+
+                    int style = GetWindowLong(hwndControl, GWL_STYLE);
+                    int newStyle = (style | WS_CHILD | WS_VISIBLE) & ~0x00C00000;
+                    SetWindowLong(hwndControl, GWL_STYLE, newStyle);
+
+                    bool swpOk = SetWindowPos(hwndControl, IntPtr.Zero,
+                        initialBounds.X, initialBounds.Y,
+                        initialBounds.Width, initialBounds.Height,
+                        0x0020 | 0x0040);
+                    Log($"UI Thread — SetWindowPos result: {swpOk} ");
+
+                    localControl.Show();
+                    Log("UI Thread — control shown ");
+
+                    // ✅ Capturar referencias en variables locales antes de usarlas
+                    Stream localStream = _stream;
+                    string localPath = pathToLoad;
+
+                    if (localStream != null && !localControl.IsDisposed)
+                    {
+                        Log("UI Thread — loading from direct STREAM ");
+                        localControl.LoadFits(localStream, "FITS Stream ");
+                    }
+                    else if (!string.IsNullOrEmpty(localPath) && !localControl.IsDisposed)
+                    {
+                        Log($"UI Thread — loading from PATH: '{localPath}' ");
+                        localControl.LoadFits(localPath);
+                    }
+                    else
+                    {
+                        Log("UI Thread — no valid stream/path or control disposed ");
+                    }
+
+                    Log("UI Thread — entering Application.Run(ApplicationContext) ");
+                    Application.Run(new ApplicationContext());
+                    Log("UI Thread — Application.Run returned ");
+                }
+                catch (Exception tEx)
+                {
+                    Log("UI Thread — EXCEPTION: " + tEx);
+                    ready.Set(); // Desbloquear caller incluso en error
+                }
+            });
+            _uiThread.IsBackground = true;
+            _uiThread.SetApartmentState(System.Threading.ApartmentState.STA);
+            _uiThread.Start();
+            Log("DoPreview — UI thread started, waiting for handle (max 3 s)... ");
+
+            bool signalled = ready.Wait(3000);
+            Log($"DoPreview — ready.Wait returned: signalled={signalled} (HWND: {_control?.Handle:X}) ");
+            if (!signalled) Log("DoPreview — ERROR: UI thread did not signal handle creation in time. ");
+        }
+        catch (Exception ex) { Log("DoPreview — EXCEPTION: " + ex); }
+    }
+/*
         public void Unload()
         {
             Log("Unload — called");
@@ -461,13 +642,86 @@ namespace FitsPreviewHandler
             }
 
             Log("Unload — cleaning up");
-            if (_stream != null)
-            {
-                try { _stream.Dispose(); } catch { }
-                _stream = null;
-            }
+	    //
+            //f (_stream != null)
+            //{
+             //   try { _stream.Dispose(); } catch { }
+              //  _stream = null;
+            //} 
+	    if (_stream != null)
+	    {
+		    try { _stream.Dispose(); } catch { }
+		    _stream = null;
+		    Log("Unload — COM IStream released");
+	    }
             Log("Unload — done");
-        }
+        } 
+    */
+	    public void Unload()
+	    {
+		    Log( "Unload — called ");
+		    var threadToJoin = _uiThread;
+		    _uiThread = null;
+
+		    if (_control != null && _control.IsHandleCreated)
+		    {
+			    Log( "Unload — disposing control and exiting UI thread message loop ");
+			    var controlToDispose = _control;
+			    _control = null;
+			    var done = new System.Threading.ManualResetEventSlim(false);
+
+			    try
+			    {
+				    controlToDispose.BeginInvoke(new Action(() =>
+					{
+						try
+						{
+							// Intentar disposición estándar
+							controlToDispose.Dispose();
+							Log( "Unload — Application.ExitThread called inside UI thread ");
+						}
+						catch (Exception ex)
+						{
+							Log( "Unload — EXCEPTION during dispose: " + ex);
+						}
+						finally
+						{
+							// ⚠️ CRÍTICO: Asegurar que el hilo muera SIEMPRE.
+							// Si Dispose falló (NRE), ExitThread no se llamó arriba.
+							// Lo forzamos aquí para evitar que el hilo se quede colgado y bloquee el explorador.
+							try { Application.ExitThread(); } catch { }
+
+							done.Set(); // Desbloquear el hilo T4 (Unload)
+						}
+					}));
+			    }
+			    catch (Exception ex)
+			    {
+				    Log( "Unload — BeginInvoke failed: " + ex.Message);
+				    done.Set();
+			    }
+
+			    Log( "Unload — waiting for UI thread to finish (max 3 s)... ");
+			    bool finished = done.Wait(3000);
+			    Log( "Unload — wait completed (finished={finished}) ");
+		    }
+
+		    if (threadToJoin != null && threadToJoin.IsAlive)
+		    {
+			    Log( "Unload — joining UI thread... ");
+			    bool joined = threadToJoin.Join(2000);
+			    Log( "Unload — thread join result: {joined} ");
+		    }
+
+		    Log( "Unload — cleaning up ");
+		    if (_stream != null)
+		    {
+			    try { _stream.Dispose(); } catch { }
+			    _stream = null;
+			    Log( "Unload — COM IStream released ");
+		    }
+		    Log( "Unload — done ");
+	    }
 
         public void SetFocus()
         {
@@ -496,11 +750,12 @@ namespace FitsPreviewHandler
             pdwAlpha = WTS_ALPHATYPE.WTSAT_RGB;
             Log($"IThumbnailProvider.GetThumbnail — cx={cx}");
 
-            Stream streamToUse   = null;
-            bool   shouldDispose = false;
+            //Stream streamToUse   = null;
+            //bool   shouldDispose = false;
             System.Drawing.Bitmap bmp = null;
+	    Stream streamToUse = ResolveStream(out bool shouldDispose);
             try
-            {
+            {   /*
                 // Resolve stream: prefer the COM IStream already handed to us,
                 // fall back to opening the file path directly.
                 if (_stream != null)
@@ -510,14 +765,20 @@ namespace FitsPreviewHandler
                     // FileShare.Delete lets the parent folder be renamed while this handle is open.
                     streamToUse   = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                     shouldDispose = true;
-                }
+                } 
 
                 if (streamToUse == null)
                 {
                     Log("GetThumbnail — no stream or path available");
                     return;
-                }
+                } */
+		    if (streamToUse == null)
+		    {
+			    Log("GetThumbnail — no stream or path available");
+			    return;
+		    }
 
+		    
                 // Step 1: parse the FITS header only (reads until END; typically a few KB).
                 // ParseFitsStream seeks to 0 internally, so stream position doesn't matter.
                 var (_, info) = FitsPreviewControl.ParseFitsStream(streamToUse);
@@ -555,11 +816,12 @@ namespace FitsPreviewHandler
                 bmp?.Dispose();
                 if (shouldDispose) streamToUse?.Dispose();
             }
-        }
+}
 
         // ── IPropertyStore Implementation ───────────────────────────────
+	/*
         private ImageInfo? GetMetadata()
-        {
+        {  
             if (_metadata.HasValue) return _metadata;
             
             Stream streamToParse = null;
@@ -584,8 +846,28 @@ namespace FitsPreviewHandler
                 finally { if (shouldDispose) streamToParse.Dispose(); }
             }
             
-            return _metadata;
-        }
+            return _metadata; 
+        } */
+	private ImageInfo? GetMetadata()
+	{
+		if (_metadata.HasValue) return _metadata;
+
+		var stream = ResolveStream(out bool shouldDispose);
+		if (stream == null) return null;
+
+		try
+		{
+			// ParseFitsStream hace Seek(0) internamente, es seguro reutilizar el stream
+			var (_, info) = FitsPreviewControl.ParseFitsStream(stream);
+			_metadata = info;
+		}
+		finally
+		{
+			if (shouldDispose) stream.Dispose(); // Solo cerramos si fue fallback
+		}
+
+		return _metadata;
+	}
 
         public uint GetCount(out uint cProps) 
         { 

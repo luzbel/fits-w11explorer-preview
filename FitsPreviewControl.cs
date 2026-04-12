@@ -117,7 +117,7 @@ namespace FitsPreviewHandler
             try   { InitializeComponent(); Log("ctor — OK"); }
             catch (Exception ex) { Log("ctor — EXCEPTION: " + ex); throw; }
         }
-
+/*
         protected override void Dispose(bool disposing)
         {
             if (disposing)
@@ -150,7 +150,61 @@ namespace FitsPreviewHandler
 		}
 	    }
             base.Dispose(disposing);
+        } */
+/*
+	protected override void Dispose(bool disposing)
+	{
+		try
+		{
+			if (disposing)
+			{
+				Log( "FitsPreviewControl.Dispose — cancelling async tasks ");
+
+				// Verificación defensiva para evitar NRE si algo falló en la inicialización
+				if (_syncRoot != null && _cts != null)
+				{
+					lock (_syncRoot)
+					{
+						if (_cts != null)
+						{
+							_cts.Cancel();
+							try { _cts.Dispose(); } catch { }
+							_cts = null;
+						}
+					}
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			// Logueamos el error interno pero no dejamos que bloquee la liberación de recursos
+			Log("Dispose inner error (ignored): " + ex.Message);
+		}
+		finally
+		{
+			// Asegurar que la base libere el HWND y los controles hijos
+			base.Dispose(disposing);
+		}
+	} 
+	*/
+
+protected override void Dispose(bool disposing)
+{
+    if (disposing)
+    {
+        Log("FitsPreviewControl.Dispose — cancelling async tasks");
+        lock (_syncRoot)
+        {
+            if (_cts != null)
+            {
+                _cts.Cancel();
+                _cts.Dispose();
+                _cts = null;
+            }
         }
+    }
+    base.Dispose(disposing);
+}
 
         private void InitializeComponent()
         {
@@ -413,6 +467,7 @@ namespace FitsPreviewHandler
         }
 
         // ── Public entry points ─────────────────────────────────────────
+
         public void LoadFits(string filePath)
         {
             Log($"LoadFits(string) — '{filePath}'");
@@ -436,8 +491,69 @@ namespace FitsPreviewHandler
                 Log("LoadFits(string) — EXCEPTION: " + ex);
                 ShowError(Strings.ErrorOpening + ex.Message);
             }
+        } 
+    public void LoadFits(Stream stream, string fileName, bool ownsStream = false)
+    {
+        Log($"LoadFits(Stream) — '{fileName}' length={stream.Length} ");
+
+        bool showImg = Settings.ShowImage;
+        bool logOn   = Settings.EnableTracing;
+
+        Action updateLayout = () => {
+            _pictureBox.Visible = showImg;
+            _lblImageHint.Visible = true;
+            if (!showImg) _lblProgress.Visible = false;
+            _lblImageHint.Text = Strings.RightClickHint;
+            _lblImageHint.Visible = true;
+            _lblLogStatus.Text = Strings.LogStatus(logOn);
+            _lblLogStatus.ForeColor = logOn ? Color.FromArgb(150, 255, 150) : Color.FromArgb(120, 120, 140);
+        };
+
+        // ✅ PROTECCIÓN: Si el control ya se está disponiendo, salir limpiamente
+        if (IsDisposed) {
+            Log("LoadFits — control already disposed, aborting");
+            if (ownsStream) try { stream.Dispose(); } catch { }
+            return;
         }
 
+        try {
+            if (InvokeRequired) Invoke(updateLayout); else updateLayout();
+        } catch (ObjectDisposedException) {
+            Log("LoadFits — disposed during Invoke, aborting");
+            if (ownsStream) try { stream.Dispose(); } catch { }
+            return;
+        }
+
+        try
+        {
+            var (rows, info) = ParseFitsStream(stream);
+            Log($"LoadFits — {rows.Count} keywords  image={info} ");
+
+            Action populate = () => PopulateGrid(rows, fileName, info);
+            if (InvokeRequired) Invoke(populate); else populate();
+
+            if (showImg && info.HasImage && !IsDisposed)
+            {
+                CancelOldLoad();
+                StartImageLoad(stream, info, _cts.Token, ownsStream);
+                ownsStream = false;
+            }
+            else if (!showImg)
+                Log("LoadFits — image loading disabled in registry ");
+            else
+                Log("LoadFits — no image data to display ");
+        }
+        catch (Exception ex)
+        {
+            Log("LoadFits(Stream) — EXCEPTION: " + ex);
+            ShowError(Strings.ErrorReadingStream + ex.Message);
+        }
+        finally
+        {
+            if (ownsStream) try { stream.Dispose(); } catch { }
+        }
+    }
+/*
         public void LoadFits(Stream stream, string fileName, bool ownsStream = false)
         {
             Log($"LoadFits(Stream) — '{fileName}' length={stream.Length}");
@@ -499,7 +615,7 @@ namespace FitsPreviewHandler
                     try { stream.Dispose(); } catch { }
                 }
             }
-        }
+        } */
 
         // ── Grid population ─────────────────────────────────────────────
         private void PopulateGrid(
@@ -529,6 +645,7 @@ namespace FitsPreviewHandler
         }
 
         // ── Async image load ────────────────────────────────────────────
+	/*
         private void StartImageLoad(Stream stream, ImageInfo info, System.Threading.CancellationToken token, bool ownsStream = false)
         {
             Log($"StartImageLoad — {info.Width}×{info.Height} planes={info.Planes} bitpix={info.BitPix} ownsStream={ownsStream}");
@@ -603,7 +720,95 @@ namespace FitsPreviewHandler
                 }
             //}, token);
             }); // sin token aquí
+        } */
+//private Task _imageLoadTask;
+
+private void StartImageLoad(Stream stream, ImageInfo info, System.Threading.CancellationToken token, bool ownsStream = false)
+{
+    Log("StartImageLoad — {info.Width}×{info.Height} planes={info.Planes} bitpix={info.BitPix} ownsStream={ownsStream}");
+
+    if (info.BitPix == 0)
+    {
+        if (ownsStream) { try { stream.Dispose(); } catch { } }
+        BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderBitpix0));
+        return;
+    }
+
+    const long MAX_BYTES = 2L * 1024 * 1024 * 1024;
+    long dataBytes = (long)info.Width * info.Height * info.Planes * info.BytesPerPixel;
+    if (dataBytes > MAX_BYTES)
+    {
+        if (ownsStream) { try { stream.Dispose(); } catch { } }
+        BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderTooLarge(dataBytes/1024/1024)));
+        return;
+    }
+
+    // ⚠️ CRÍTICO: NO pasar token a Task.Run. Si está cancelado, el delegate se salta
+    // y el bloque finally (que cierra el stream) NUNCA se ejecuta → HANDLE ABIERTO → BLOQUEO.
+    _imageLoadTask = Task.Run(() =>
+    {
+        try
+        {
+            // Si ya estaba cancelado antes de empezar, salir pero asegurar cierre
+            if (token.IsCancellationRequested) {
+                if (ownsStream) { try { stream.Dispose(); } catch { } }
+                return;
+            }
+
+            void Report(string msg) => BeginInvoke(new Action(() => {
+                if (!IsDisposed && _cts != null && !_cts.IsCancellationRequested) {
+                    _lblProgress.Text = msg;
+                    _lblProgress.Visible = true;
+                }
+            }));
+
+            // ⚡ STRIDE AGRESIVO: maxDim=600 reduce lectura a ~1% para imágenes grandes
+            Bitmap bmp = RenderImage(stream, info, token, Report, maxDim: 600);
+
+            if (bmp != null && !token.IsCancellationRequested && !IsDisposed)
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    if (_pictureBox.Image != null) { _pictureBox.Image.Dispose(); _pictureBox.Image = null; }
+                    _pictureBox.Image = bmp;
+                    _pictureBox.Visible = true;
+                    _lblProgress.Visible = false;
+                }));
+            }
+            else if (bmp != null)
+            {
+                bmp.Dispose();
+            }
         }
+        // ⚠️ CAPTURA EXPLÍCITA: El Shell/Unload puede disponer el COM Stream mientras leemos.
+        // Si no se captura, prevhost.exe entra en estado inestable y bloquea carpetas.
+        catch (OperationCanceledException) { }
+        catch (System.ObjectDisposedException) { } 
+        catch (System.Runtime.InteropServices.COMException) { }
+        catch (Exception ex)
+        {
+            if (!token.IsCancellationRequested && !IsDisposed)
+                Log("StartImageLoad — EXCEPTION: " + ex);
+        }
+        finally
+        {
+            // ✅ GARANTÍA: Este bloque SIEMPRE se ejecuta porque quitamos el token de Task.Run
+            if (ownsStream) { try { stream.Dispose(); } catch { } }
+        }
+    });
+}
+
+public void WaitRenderTask(int timeoutMs = 2000)
+{
+    lock (_syncRoot)
+    {
+        if (_cts != null) { _cts.Cancel(); _cts.Dispose(); _cts = null; }
+    }
+    // Esperamos brevemente a que el ThreadPool termine el finally.
+    // Timeout corto para evitar deadlocks si la tarea está bloqueada en I/O de nube.
+    _imageLoadTask?.Wait(timeoutMs);
+}
+
 
         // ── Rendering pipeline ──────────────────────────────────────────
         private static Bitmap RenderImage(Stream stream, ImageInfo info, System.Threading.CancellationToken token, Action<string> reportProgress = null, int maxDim = 2000)
