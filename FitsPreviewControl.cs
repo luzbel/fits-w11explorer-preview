@@ -1290,6 +1290,7 @@ public void WaitRenderTask(int timeoutMs = 2000)
         /// and the FILTER keyword via an accent colour + text label.
         /// Zero pixel data is read — uses only the already-parsed <see cref="ImageInfo"/> metadata.
         /// </summary>
+	/*
         internal static Bitmap RenderStaticBadge(ImageInfo info, int size)
         {
             string typeRaw = (info.ImageType ?? string.Empty).ToLowerInvariant().Trim();
@@ -1375,8 +1376,120 @@ public void WaitRenderTask(int timeoutMs = 2000)
                 bmp?.Dispose();
                 return null;
             }
-        }
+        } */
 
+    ///  <summary >
+    /// Renders a "Top-Heavy" identification badge with dynamic font fitting.
+    /// - Positions text in the UPPER half to avoid folder overlays.
+    /// - Uses a loop to shrink font size so it NEVER gets cut off.
+    /// - Improved "FITS" subtitle visibility (Solid color, larger, bold).
+    ///  </summary >
+    internal static Bitmap RenderStaticBadge(ImageInfo info, int size)
+    {
+        string typeRaw = (info.ImageType ?? string.Empty).ToLowerInvariant().Trim();
+
+        string frameLabel = "FITS";
+        Color bgColor;
+        Color textColor;
+
+        // Paleta de colores
+        if      (typeRaw.Contains("light")) { frameLabel = "LIGHT"; bgColor = Color.FromArgb(12, 16, 35); textColor = Color.FromArgb(220, 230, 255); }
+        else if (typeRaw.Contains("flat"))  { frameLabel = "FLAT";  bgColor = Color.FromArgb(215, 220, 230); textColor = Color.FromArgb(20, 25, 35); }
+        else if (typeRaw.Contains("dark"))  { frameLabel = "DARK";  bgColor = Color.FromArgb(40, 10, 10); textColor = Color.FromArgb(255, 180, 180); }
+        else if (typeRaw.Contains("bias"))  { frameLabel = "BIAS";  bgColor = Color.FromArgb(18, 18, 25); textColor = Color.FromArgb(190, 190, 210); }
+        else                                { frameLabel = "FITS";  bgColor = Color.FromArgb(20, 20, 30); textColor = Color.Silver; }
+
+        Color accentColor = GetFilterAccentColor(info.Filter);
+
+        var bmp = new Bitmap(size, size, PixelFormat.Format24bppRgb);
+        try
+        {
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                g.Clear(bgColor);
+
+                // 1. BARRA SUPERIOR (Filtro)
+                int stripeH = Math.Max(2, size / 12);
+                using (var sb = new SolidBrush(accentColor))
+                    g.FillRectangle(sb, 0, 0, size, stripeH);
+
+                // 2. ZONA SEGURA (Zona "Top-Heavy")
+                // Definimos un rectángulo en la parte SUPERIOR donde el texto DEBE caber.
+                float padding = size * 0.05f;
+                RectangleF textRect = new RectangleF(
+                    padding,
+                    stripeH + padding,
+                    size - (padding * 2),
+                    (size * 0.55f) - stripeH // Ocupa el 55% superior disponible
+                );
+
+                // 3. BUCLE DE AJUSTE DE FUENTE (Font Fitting)
+                // Empezamos con un tamaño grande y lo reducimos hasta que mida menos que el ancho del rect.
+                float fontSize = size * 0.50f;
+                SizeF textSize = SizeF.Empty;
+
+                using (var testBrush = new SolidBrush(textColor))
+                {
+                    while (fontSize > 6f) // Mínimo legible 6px
+                    {
+                        using (var testFont = new Font("Segoe UI", fontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+                        {
+                            textSize = g.MeasureString(frameLabel, testFont);
+                            if (textSize.Width <= textRect.Width)
+                                break; // ¡Cabe perfectamente!
+
+                            fontSize -= 1f; // Reducir 1 píxel y probar de nuevo
+                        }
+                    }
+
+                    // 4. DIBUJAR TEXTO PRINCIPAL
+                    using (var mainFont = new Font("Segoe UI", fontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+                    {
+                        using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Near })
+                        {
+                            g.DrawString(frameLabel, mainFont, testBrush, textRect, sf);
+                        }
+                    }
+                }
+
+                // 5. ETIQUETA "FITS" (Pie de página)
+                // MEJORADA: Más grande, negrita y color sólido de alto contraste
+                float footerFontSize = size * 0.16f;
+                if (footerFontSize < 7f) footerFontSize = 7f; // Mínimo 7px
+
+                // Color sólido inteligente: Oscuro sobre fondo claro, Claro sobre fondo oscuro
+                Color footerColor = bgColor.GetBrightness() > 0.5f
+                    ? Color.FromArgb(80, 80, 90)   // Gris oscuro para fondos claros (FLAT)
+                    : Color.FromArgb(220, 220, 230); // Blanco hueso para fondos oscuros
+
+                using (var footerFont = new Font("Segoe UI", footerFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (var footerBrush = new SolidBrush(footerColor))
+                {
+                    string footerText = "FITS";
+                    SizeF fSize = g.MeasureString(footerText, footerFont);
+
+                    if (fSize.Width <= size * 0.95f)
+                    {
+                        PointF fPt = new PointF(
+                            (size - fSize.Width) / 2f,
+                            size - fSize.Height - (size * 0.05f) // Margen inferior
+                        );
+                        g.DrawString(footerText, footerFont, footerBrush, fPt);
+                    }
+                }
+            }
+            return bmp;
+        }
+        catch
+        {
+            bmp?.Dispose();
+            return null;
+        }
+    }
+    
+        
         /// <summary>Maps a FITS FILTER keyword value to a badge accent colour.</summary>
         private static Color GetFilterAccentColor(string filter)
         {
