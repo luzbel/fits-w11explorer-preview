@@ -14,10 +14,12 @@ namespace FitsPreviewHandler
     {
         private IStream _source;
         private bool _disposed;
+        private bool _leaveOpen;
 
-        public ComStreamWrapper(IStream source)
+        public ComStreamWrapper(IStream source, bool leaveOpen = false)
         {
             _source = source ?? throw new ArgumentNullException(nameof(source));
+            _leaveOpen = leaveOpen;
         }
 
         public override bool CanRead  => !_disposed;
@@ -86,7 +88,10 @@ namespace FitsPreviewHandler
                 {
                     // Release our COM reference so the shell's IStream ref-count can reach
                     // zero and the underlying Win32 file handle can be closed immediately.
-                    try { Marshal.ReleaseComObject(_source); } catch { }
+                    if (!_leaveOpen)
+                    {
+                        try { Marshal.ReleaseComObject(_source); } catch { }
+                    }
                     _source = null;
                 }
             }

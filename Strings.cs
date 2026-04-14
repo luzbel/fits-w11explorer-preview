@@ -32,6 +32,7 @@ namespace FitsPreviewHandler
         public static string RenderTooLarge(long mb) => IsEs ? $"⚠ Imagen demasiado grande ({mb} MB)" : $"⚠ Image too large ({mb} MB)";
         public static string RenderError(string err) => IsEs ? $"Error de renderizado: {err}" : $"Render Error: {err}";
         public static string RenderProgress(double pct) => IsEs ? $"Leyendo datos FITS... {pct:F0}%" : $"Reading FITS data... {pct:F0}%";
+        public static string RenderLoading => IsEs ? "Cargando datos FITS..." : "Loading FITS data...";
         
         // Context Menu
         public static string MenuHideImage => IsEs ? "Ocultar imagen (carga ultra-rápida). Solo tabla" : "Hide image (ultra-fast loading). Metadata only";

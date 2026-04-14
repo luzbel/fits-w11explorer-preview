@@ -13,8 +13,96 @@ using System.Windows.Forms;
 
 namespace FitsPreviewHandler
 {
+    // ── SampledStream ───────────────────────────────────────────────
+    // A minimal memory stream that only stores specific blocks (header + rows)
+    // serving zeros for everything else. Absolute seeks work as in full file.
+    internal class SampledStream : Stream
+    {
+        private readonly Dictionary<long, byte[]> _samples = new Dictionary<long, byte[]>();
+        private readonly long _length;
+        private long _pos;
+        public override bool CanRead => true;
+        public override bool CanSeek => true;
+        public override bool CanWrite => false;
+        public override long Length => _length;
+        public override long Position { get { return _pos; } set { _pos = value; } }
+        public long BufferedBytes { get; private set; }
+        public int SampleCount => _samples.Count;
+
+        private readonly long _dataOffset;
+        public SampledStream(int w, int h, int bitpix, long dataOff) 
+        {
+            _dataOffset = dataOff;
+            _length = dataOff + (long)w * h * (Math.Abs(bitpix)/8);
+        }
+        public void WriteSample(long offset, byte[] data) {
+            byte[] copy = new byte[data.Length]; Array.Copy(data, copy, data.Length);
+            _samples[offset] = copy; BufferedBytes += data.Length;
+        }
+        public override int Read(byte[] buffer, int offset, int count) {
+            if (_pos >= _length) return 0;
+            int toRead = (int)Math.Min(count, _length - _pos);
+            Array.Clear(buffer, offset, toRead);
+            
+            // Find the nearest sample with the same vertical parity (for Bayer/Color integrity).
+            long bestKey = -1;
+            long minDiff = long.MaxValue;
+            long relPos = _pos - _dataOffset;
+            
+            if (relPos < 0) {
+                // Header area: just find absolute nearest
+                foreach (var k in _samples.Keys) {
+                    long diff = Math.Abs(k - _pos);
+                    if (diff < minDiff) { minDiff = diff; bestKey = k; }
+                }
+            } else {
+                // Data area: match row parity if possible
+                long rowLen = (_samples.Count > 1) ? _samples.Values.ElementAt(1).Length : 1; // Element 0 is header
+                long requestedRowIdx = relPos / rowLen;
+
+                foreach (var k in _samples.Keys) {
+                    if (k < _dataOffset) continue;
+                    long sampleRowIdx = (k - _dataOffset) / rowLen;
+                    if (sampleRowIdx % 2 != requestedRowIdx % 2) continue; // Match parity
+                    
+                    long diff = Math.Abs(k - _pos);
+                    if (diff < minDiff) { minDiff = diff; bestKey = k; }
+                }
+                
+                // Fallback to absolute nearest if no parity match found
+                if (bestKey == -1) {
+                    foreach (var k in _samples.Keys) {
+                        long diff = Math.Abs(k - _pos);
+                        if (diff < minDiff) { minDiff = diff; bestKey = k; }
+                    }
+                }
+            }
+
+            if (bestKey != -1) {
+                byte[] sample = _samples[bestKey];
+                long rowLen = sample.Length;
+                int colIdx = (int)((_pos - _dataOffset) % rowLen);
+                if (colIdx < 0) colIdx = (int)(_pos % rowLen); // Header fallback
+                
+                int n = Math.Min(toRead, (int)rowLen - colIdx);
+                Array.Copy(sample, colIdx, buffer, offset, n);
+            }
+            
+            _pos += toRead; return toRead;
+        }
+        public override long Seek(long offset, SeekOrigin origin) {
+            if (origin == SeekOrigin.Begin) _pos = offset;
+            else if (origin == SeekOrigin.Current) _pos += offset;
+            else _pos = _length + offset;
+            return _pos;
+        }
+        public override void Flush() { }
+        public override void SetLength(long value) { }
+        public override void Write(byte[] buffer, int offset, int count) { }
+    }
+
     // ── Image metadata extracted from the FITS primary header ───────────
-    internal struct ImageInfo
+    public struct ImageInfo
     {
         public int    Width;         // NAXIS1
         public int    Height;        // NAXIS2
@@ -90,6 +178,9 @@ namespace FitsPreviewHandler
         private Label         _lblImageHint;
         private Label         _lblLogStatus;
         private TextBox       _txtError;
+        private StatusStrip   _statusStrip;
+        private ToolStripStatusLabel _statusLabel;
+        private ToolStripStatusLabel _versionLabel;
 
         // ── Concurrency ─────────────────────────────────────────────────
         private System.Threading.CancellationTokenSource _cts;
@@ -117,7 +208,7 @@ namespace FitsPreviewHandler
             try   { InitializeComponent(); Log("ctor — OK"); }
             catch (Exception ex) { Log("ctor — EXCEPTION: " + ex); throw; }
         }
-/*
+
         protected override void Dispose(bool disposing)
         {
             if (disposing)
@@ -132,79 +223,19 @@ namespace FitsPreviewHandler
                         _cts = null;
                     }
                 }
-
-		// Esperar a que la tarea termine para garantizar que el 
-		// FileStream se haya cerrado antes de devolver el control al Shell
-		_imageLoadTask?.Wait(3000);
-                lock (_syncRoot)
-		{
-                        _cts.Dispose();
-			_cts = null;
-		}
-
-		// Liberar recursos GDI explícitamente (WinForms no lo hace automáticamente)
-		if (_pictureBox.Image != null)
-		{
-			_pictureBox.Image.Dispose();
-			_pictureBox.Image = null;
-		}
-	    }
-            base.Dispose(disposing);
-        } */
-/*
-	protected override void Dispose(bool disposing)
-	{
-		try
-		{
-			if (disposing)
-			{
-				Log( "FitsPreviewControl.Dispose — cancelling async tasks ");
-
-				// Verificación defensiva para evitar NRE si algo falló en la inicialización
-				if (_syncRoot != null && _cts != null)
-				{
-					lock (_syncRoot)
-					{
-						if (_cts != null)
-						{
-							_cts.Cancel();
-							try { _cts.Dispose(); } catch { }
-							_cts = null;
-						}
-					}
-				}
-			}
-		}
-		catch (Exception ex)
-		{
-			// Logueamos el error interno pero no dejamos que bloquee la liberación de recursos
-			Log("Dispose inner error (ignored): " + ex.Message);
-		}
-		finally
-		{
-			// Asegurar que la base libere el HWND y los controles hijos
-			base.Dispose(disposing);
-		}
-	} 
-	*/
-
-protected override void Dispose(bool disposing)
-{
-    if (disposing)
-    {
-        Log("FitsPreviewControl.Dispose — cancelling async tasks");
-        lock (_syncRoot)
-        {
-            if (_cts != null)
-            {
-                _cts.Cancel();
-                _cts.Dispose();
-                _cts = null;
+                
+                // Ensure the background task is finished before we fully dispose
+                // to avoid COM stream access violations during Unload.
+                _imageLoadTask?.Wait(2000);
+                
+                if (_pictureBox.Image != null)
+                {
+                    _pictureBox.Image.Dispose();
+                    _pictureBox.Image = null;
+                }
             }
+            base.Dispose(disposing);
         }
-    }
-    base.Dispose(disposing);
-}
 
         private void InitializeComponent()
         {
@@ -395,25 +426,45 @@ protected override void Dispose(bool disposing)
             _topPanel.ContextMenuStrip = ctxMenu;
             _lblImageHint.ContextMenuStrip = ctxMenu;
 
+            // ── Status bar ──────────────────────────────────────────────
+            _statusStrip = new StatusStrip { BackColor = Color.FromArgb(40, 40, 60), SizingGrip = false };
+            _statusLabel = new ToolStripStatusLabel { 
+                Text = Strings.RightClickHint, 
+                ForeColor = Color.FromArgb(160, 160, 180),
+                Spring = true,
+                TextAlign = ContentAlignment.MiddleLeft
+            };
+            _versionLabel = new ToolStripStatusLabel { 
+                Text = $"v1.3.0 · 2026-04-14 20:15", 
+                ForeColor = Color.FromArgb(110, 110, 140),
+                Font = new Font("Segoe UI", 8f)
+            };
+            _statusStrip.Items.Add(_statusLabel);
+            _statusStrip.Items.Add(_versionLabel);
+
             ctxMenu.Opening += (s, e) => {
                 ctxMenu.Items.Clear();
                 bool currentShowImg = Settings.ShowImage;
                 bool currentLogOn = Settings.EnableTracing;
 
+                var itemVer = new ToolStripMenuItem($"Fits Preview v1.3.0") { Enabled = false };
+                var itemDate = new ToolStripMenuItem($"Built: 2026-04-14 20:15") { Enabled = false };
+                ctxMenu.Items.Add(itemVer);
+                ctxMenu.Items.Add(itemDate);
+                ctxMenu.Items.Add(new ToolStripSeparator());
+
                 var itemImg = new ToolStripMenuItem(currentShowImg ? Strings.MenuHideImage : Strings.MenuShowImage);
                 itemImg.Click += (sender, args) => {
                     Settings.ShowImage = !currentShowImg;
-                    _lblImageHint.Text = Strings.MenuSavedImage;
-                    _lblImageHint.ForeColor = Color.FromArgb(180, 255, 180);
-                    _lblImageHint.Visible = true;
+                    _statusLabel.Text = Strings.MenuSavedImage;
+                    _statusLabel.ForeColor = Color.FromArgb(180, 255, 180);
                 };
                 
                 var itemLog = new ToolStripMenuItem(currentLogOn ? Strings.MenuDisableTrace : Strings.MenuEnableTrace);
                 itemLog.Click += (sender, args) => {
                     Settings.EnableTracing = !currentLogOn;
-                    _lblImageHint.Text = Strings.MenuSavedTrace;
-                    _lblImageHint.ForeColor = Color.FromArgb(180, 255, 180);
-                    _lblImageHint.Visible = true;
+                    _statusLabel.Text = Strings.MenuSavedTrace;
+                    _statusLabel.ForeColor = Color.FromArgb(180, 255, 180);
                 };
 
                 ctxMenu.Items.Add(itemImg);
@@ -462,6 +513,7 @@ protected override void Dispose(bool disposing)
 
             Controls.Add(_split);
             Controls.Add(_topPanel);
+            Controls.Add(_statusStrip);
             Controls.Add(_txtError);
             Log("InitializeComponent — done");
         }
@@ -492,130 +544,65 @@ protected override void Dispose(bool disposing)
                 ShowError(Strings.ErrorOpening + ex.Message);
             }
         } 
-    public void LoadFits(Stream stream, string fileName, bool ownsStream = false)
-    {
-        Log($"LoadFits(Stream) — '{fileName}' length={stream.Length} ");
-
-        bool showImg = Settings.ShowImage;
-        bool logOn   = Settings.EnableTracing;
-
-        Action updateLayout = () => {
-            _pictureBox.Visible = showImg;
-            _lblImageHint.Visible = true;
-            if (!showImg) _lblProgress.Visible = false;
-            _lblImageHint.Text = Strings.RightClickHint;
-            _lblImageHint.Visible = true;
-            _lblLogStatus.Text = Strings.LogStatus(logOn);
-            _lblLogStatus.ForeColor = logOn ? Color.FromArgb(150, 255, 150) : Color.FromArgb(120, 120, 140);
-        };
-
-        // ✅ PROTECCIÓN: Si el control ya se está disponiendo, salir limpiamente
-        if (IsDisposed) {
-            Log("LoadFits — control already disposed, aborting");
-            if (ownsStream) try { stream.Dispose(); } catch { }
-            return;
-        }
-
-        try {
-            if (InvokeRequired) Invoke(updateLayout); else updateLayout();
-        } catch (ObjectDisposedException) {
-            Log("LoadFits — disposed during Invoke, aborting");
-            if (ownsStream) try { stream.Dispose(); } catch { }
-            return;
-        }
-
-        try
+        public void LoadFits(Stream stream, string fileName, bool ownsStream = false, List<(string, string, string)> preParsedKeywords = null, ImageInfo? preParsedInfo = null)
         {
-            var (rows, info) = ParseFitsStream(stream);
-            Log($"LoadFits — {rows.Count} keywords  image={info} ");
+            Log($"LoadFits(Stream) — '{fileName}'");
 
-            Action populate = () => PopulateGrid(rows, fileName, info);
-            if (InvokeRequired) Invoke(populate); else populate();
-
-            if (showImg && info.HasImage && !IsDisposed)
-            {
-                CancelOldLoad();
-                StartImageLoad(stream, info, _cts.Token, ownsStream);
-                ownsStream = false;
-            }
-            else if (!showImg)
-                Log("LoadFits — image loading disabled in registry ");
-            else
-                Log("LoadFits — no image data to display ");
-        }
-        catch (Exception ex)
-        {
-            Log("LoadFits(Stream) — EXCEPTION: " + ex);
-            ShowError(Strings.ErrorReadingStream + ex.Message);
-        }
-        finally
-        {
-            if (ownsStream) try { stream.Dispose(); } catch { }
-        }
-    }
-/*
-        public void LoadFits(Stream stream, string fileName, bool ownsStream = false)
-        {
-            Log($"LoadFits(Stream) — '{fileName}' length={stream.Length}");
-            
             bool showImg = Settings.ShowImage;
             bool logOn   = Settings.EnableTracing;
-            Log($"LoadFits — ShowImage={showImg} Log={logOn} SplitterDistance={_split.SplitterDistance} TotalHeight={_split.Height}");
 
             Action updateLayout = () => {
-                // If image is disabled, show placeholder text in Panel1 instead of collapsing it
                 _pictureBox.Visible = showImg;
-                _lblImageHint.Visible = true;
-                
-                if (!showImg)
-                {
-                    _lblProgress.Visible = false;
-                }
-                
+                _split.Panel1Collapsed = !showImg;
+                if (!showImg) _lblProgress.Visible = false;
                 _lblImageHint.Text = Strings.RightClickHint;
                 _lblImageHint.Visible = true;
-
                 _lblLogStatus.Text = Strings.LogStatus(logOn);
                 _lblLogStatus.ForeColor = logOn ? Color.FromArgb(150, 255, 150) : Color.FromArgb(120, 120, 140);
             };
+
             if (InvokeRequired) Invoke(updateLayout); else updateLayout();
 
             try
             {
-                var (rows, info) = ParseFitsStream(stream);
-                Log($"LoadFits — {rows.Count} keywords  image={info}");
+                List<(string, string, string)> rows;
+                ImageInfo info;
+
+                if (preParsedKeywords != null && preParsedInfo.HasValue)
+                {
+                    rows = preParsedKeywords;
+                    info = preParsedInfo.Value;
+                }
+                else
+                {
+                    (rows, info) = ParseFitsStream(stream);
+                }
 
                 Action populate = () => PopulateGrid(rows, fileName, info);
                 if (InvokeRequired) Invoke(populate); else populate();
 
-                if (showImg && info.HasImage)
+                if (showImg && info.HasImage && !IsDisposed)
                 {
                     CancelOldLoad();
-                    // Pass ownsStream so the async task disposes it when finished.
-                    // This keeps the stream alive (and the file handle open with
-                    // FileShare.Delete) for the full duration of the render.
                     StartImageLoad(stream, info, _cts.Token, ownsStream);
                     ownsStream = false; // task now owns it
                 }
-                else if (!showImg)
-                    Log("LoadFits — image loading disabled in registry");
                 else
-                    Log("LoadFits — no image data to display");
+                {
+                    if (!showImg) Log("LoadFits — image loading disabled in registry");
+                    else if (!info.HasImage) Log("LoadFits — no image data to display");
+                    
+                    // If no image task, we must dispose now if we own it
+                    if (ownsStream) { try { stream.Dispose(); } catch { } ownsStream = false; }
+                }
             }
             catch (Exception ex)
             {
                 Log("LoadFits(Stream) — EXCEPTION: " + ex);
                 ShowError(Strings.ErrorReadingStream + ex.Message);
+                if (ownsStream) try { stream.Dispose(); } catch { }
             }
-            finally
-            {
-                // Dispose only if the task didn't take ownership (no image, error, etc.)
-                if (ownsStream)
-                {
-                    try { stream.Dispose(); } catch { }
-                }
-            }
-        } */
+        }
 
         // ── Grid population ─────────────────────────────────────────────
         private void PopulateGrid(
@@ -641,162 +628,114 @@ protected override void Dispose(bool disposing)
                 else if (kw == "COMMENT" || kw == "HISTORY") _gridHeader.Rows[idx].DefaultCellStyle.ForeColor = Color.FromArgb(160, 200, 140);
                 else if (kw.StartsWith("NAXIS"))             _gridHeader.Rows[idx].DefaultCellStyle.ForeColor = Color.FromArgb(255, 200, 100);
             }
+            
+            _gridHeader.Update(); // Force table paint immediately
+            this.Update(); // Force window paint immediately
             Log("PopulateGrid — done");
         }
 
         // ── Async image load ────────────────────────────────────────────
-	/*
         private void StartImageLoad(Stream stream, ImageInfo info, System.Threading.CancellationToken token, bool ownsStream = false)
         {
-            Log($"StartImageLoad — {info.Width}×{info.Height} planes={info.Planes} bitpix={info.BitPix} ownsStream={ownsStream}");
-
-            if (info.BitPix == 0)
-            {
-                if (ownsStream) { try { stream.Dispose(); } catch { } }
-                BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderBitpix0));
-                return;
-            }
-
-            const long MAX_BYTES = 2L * 1024 * 1024 * 1024;
-            long dataBytes = (long)info.Width * info.Height * info.Planes * info.BytesPerPixel;
-            if (dataBytes > MAX_BYTES)
-            {
-                if (ownsStream) { try { stream.Dispose(); } catch { } }
-                BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderTooLarge(dataBytes/1024/1024)));
-                return;
-            }
-
-	    // ← USAR CancellationToken.None para garantizar que el delegate se ejecute
-	    // y el bloque `finally` siempre disponga el stream.
-
             _imageLoadTask = Task.Run(() =>
             {
-	    	// Si se canceló antes de empezar, asegurar cierre inmediato
-		if (token.IsCancellationRequested && ownsStream) {
-			try { stream.Dispose(); } catch {}
-			return;
-		}
-
                 try
                 {
+                    if (token.IsCancellationRequested) { if (ownsStream) stream.Dispose(); return; }
+
+                    // 1. If we are reading from a COM stream or FileStream, 
+                    //    first convert it into a COMPACT SampledStream in memory 
+                    //    and release the source handle IMMEDIATELY. 
+                    //    Total metadata + pixels for preview (600 rows) is usually < 10 MB.
+                    Stream sourceStream = stream;
+                    if (!(stream is SampledStream))
+                    {
+                        void BufferReport(string msg) => BeginInvoke(new Action(() => {
+                            if (!IsDisposed && _cts != null && !_cts.IsCancellationRequested) {
+                                _lblProgress.Text = msg;
+                                _lblProgress.Visible = true;
+                            }
+                        }));
+
+                        BufferReport(Strings.RenderLoading);
+                        int targetDim = 600;
+                        var ss = new SampledStream(info.Width, info.Height, info.BitPix, info.DataOffset);
+                        
+                        // Clone header
+                        sourceStream.Seek(0, SeekOrigin.Begin);
+                        byte[] hbuf = new byte[info.DataOffset > 0 ? info.DataOffset : 2880];
+                        sourceStream.Read(hbuf, 0, hbuf.Length);
+                        ss.WriteSample(0, hbuf);
+
+                        // Capture sampled rows
+                        double aspect = (double)info.Width / info.Height;
+                        int outW = info.Width >= info.Height ? Math.Min(info.Width, targetDim) : Math.Max(1, (int)(Math.Min(info.Height, targetDim) * aspect));
+                        int outH = info.Width >= info.Height ? Math.Max(1, (int)(outW / aspect)) : Math.Min(info.Height, targetDim);
+                        bool isBayer = !string.IsNullOrEmpty(info.BayerPattern) && info.Planes == 1;
+                        int sy = Math.Max(1, info.Height / outH);
+                        if (isBayer) sy = (sy / 2) * 2; // Keep Bayer pairs together
+                        if (sy < 1) sy = 1;
+
+                        int bpp = info.BytesPerPixel;
+                        long rowBytes = (long)info.Width * bpp;
+                        byte[] row = new byte[rowBytes];
+
+                        for (int p = 0; p < info.Planes; p++)
+                        {
+                            if (token.IsCancellationRequested) break;
+                            long planeOff = info.DataOffset + (long)p * info.Height * rowBytes;
+                            for (int y = 0; y <= info.Height - (isBayer ? 2 : 1); y += sy)
+                            {
+                                if (token.IsCancellationRequested) break;
+                                if (y % (sy * 20) == 0) BufferReport(Strings.RenderProgress(y * 100 / info.Height));
+
+                                sourceStream.Seek(planeOff + (long)y * rowBytes, SeekOrigin.Begin);
+                                sourceStream.Read(row, 0, (int)rowBytes);
+                                ss.WriteSample(planeOff + (long)y * rowBytes, row);
+                                if (isBayer) {
+                                    sourceStream.Read(row, 0, (int)rowBytes);
+                                    ss.WriteSample(planeOff + (long)(y+1) * rowBytes, row);
+                                }
+                            }
+                        }
+                        
+                        if (token.IsCancellationRequested) {
+                            if (ownsStream) sourceStream.Dispose();
+                            ss.Dispose();
+                            return;
+                        }
+
+                        ss.Position = 0;
+                        if (ownsStream) sourceStream.Dispose();
+                        sourceStream = ss;
+                        Log($"  Render switched to SampledStream ({ss.BufferedBytes/1024} KB). Source handle released.");
+                    }
+
                     void Report(string msg) => BeginInvoke(new Action(() => {
-                        _lblProgress.Text = msg;
-                        _lblProgress.Visible = true;
+                        if (!IsDisposed && _cts != null && !_cts.IsCancellationRequested) {
+                            _lblProgress.Text = msg;
+                            _lblProgress.Visible = true;
+                        }
                     }));
 
-                    Bitmap bmp = RenderImage(stream, info, token, Report);
-                    if (bmp != null && !token.IsCancellationRequested)
+                    Bitmap bmp = RenderImage(sourceStream, info, token, Report, maxDim: 600);
+                    if (bmp != null && !token.IsCancellationRequested && !IsDisposed)
                     {
                         BeginInvoke(new Action(() =>
                         {
-			    // Liberar imagen anterior para evitar fugas GDI
-			    if (_pictureBox.Image != null) { _pictureBox.Image.Dispose(); _pictureBox.Image = null; }
+                            if (_pictureBox.Image != null) { _pictureBox.Image.Dispose(); _pictureBox.Image = null; }
                             _pictureBox.Image = bmp;
                             _pictureBox.Visible = true;
                             _lblProgress.Visible = false;
                         }));
                     }
-		    else if (bmp != null)
-		    {
-			    bmp.Dispose(); // Cancelado antes de asignar
-		    }
+                    else if (bmp != null) bmp.Dispose();
+                    
+                    if (sourceStream is SampledStream) sourceStream.Dispose();
                 }
-                catch (Exception ex)
-                {
-                    Log("StartImageLoad — EXCEPTION: " + ex);
-                    if (!IsDisposed)
-                        BeginInvoke(new Action(() => {
-                            _lblProgress.Text = Strings.RenderError(ex.Message);
-                            _lblProgress.Visible = true;
-                        }));
-                }
-                finally
-                {
-                    // Release the file handle as soon as rendering is done (or cancelled/failed)
-                    if (ownsStream)
-                    {
-                        try { stream.Dispose(); } catch { }
-                    }
-                }
-            //}, token);
-            }); // sin token aquí
-        } */
-//private Task _imageLoadTask;
-
-private void StartImageLoad(Stream stream, ImageInfo info, System.Threading.CancellationToken token, bool ownsStream = false)
-{
-    Log("StartImageLoad — {info.Width}×{info.Height} planes={info.Planes} bitpix={info.BitPix} ownsStream={ownsStream}");
-
-    if (info.BitPix == 0)
-    {
-        if (ownsStream) { try { stream.Dispose(); } catch { } }
-        BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderBitpix0));
-        return;
-    }
-
-    const long MAX_BYTES = 2L * 1024 * 1024 * 1024;
-    long dataBytes = (long)info.Width * info.Height * info.Planes * info.BytesPerPixel;
-    if (dataBytes > MAX_BYTES)
-    {
-        if (ownsStream) { try { stream.Dispose(); } catch { } }
-        BeginInvoke(new Action(() => _lblProgress.Text = Strings.RenderTooLarge(dataBytes/1024/1024)));
-        return;
-    }
-
-    // ⚠️ CRÍTICO: NO pasar token a Task.Run. Si está cancelado, el delegate se salta
-    // y el bloque finally (que cierra el stream) NUNCA se ejecuta → HANDLE ABIERTO → BLOQUEO.
-    _imageLoadTask = Task.Run(() =>
-    {
-        try
-        {
-            // Si ya estaba cancelado antes de empezar, salir pero asegurar cierre
-            if (token.IsCancellationRequested) {
-                if (ownsStream) { try { stream.Dispose(); } catch { } }
-                return;
-            }
-
-            void Report(string msg) => BeginInvoke(new Action(() => {
-                if (!IsDisposed && _cts != null && !_cts.IsCancellationRequested) {
-                    _lblProgress.Text = msg;
-                    _lblProgress.Visible = true;
-                }
-            }));
-
-            // ⚡ STRIDE AGRESIVO: maxDim=600 reduce lectura a ~1% para imágenes grandes
-            Bitmap bmp = RenderImage(stream, info, token, Report, maxDim: 600);
-
-            if (bmp != null && !token.IsCancellationRequested && !IsDisposed)
-            {
-                BeginInvoke(new Action(() =>
-                {
-                    if (_pictureBox.Image != null) { _pictureBox.Image.Dispose(); _pictureBox.Image = null; }
-                    _pictureBox.Image = bmp;
-                    _pictureBox.Visible = true;
-                    _lblProgress.Visible = false;
-                }));
-            }
-            else if (bmp != null)
-            {
-                bmp.Dispose();
-            }
+                catch (Exception ex) { if (!token.IsCancellationRequested) Log("StartImageLoad EXCEPTION: " + ex); }
+            });
         }
-        // ⚠️ CAPTURA EXPLÍCITA: El Shell/Unload puede disponer el COM Stream mientras leemos.
-        // Si no se captura, prevhost.exe entra en estado inestable y bloquea carpetas.
-        catch (OperationCanceledException) { }
-        catch (System.ObjectDisposedException) { } 
-        catch (System.Runtime.InteropServices.COMException) { }
-        catch (Exception ex)
-        {
-            if (!token.IsCancellationRequested && !IsDisposed)
-                Log("StartImageLoad — EXCEPTION: " + ex);
-        }
-        finally
-        {
-            // ✅ GARANTÍA: Este bloque SIEMPRE se ejecuta porque quitamos el token de Task.Run
-            if (ownsStream) { try { stream.Dispose(); } catch { } }
-        }
-    });
-}
 
 public void WaitRenderTask(int timeoutMs = 2000)
 {
@@ -1153,13 +1092,22 @@ public void WaitRenderTask(int timeoutMs = 2000)
             var result = new List<(string, string, string)>();
             var info   = new ImageInfo { BScale = 1.0, Planes = 1 };
 
-            Log($"ParseFitsStream — pos={stream.Position}");
+            // 1. Fast Bail for non-FITS: first 8 bytes must be 'SIMPLE  '
+            byte[] magic = new byte[8];
+            stream.Read(magic, 0, 8);
+            if (Encoding.ASCII.GetString(magic) != "SIMPLE  ") {
+                Log("ParseFitsStream — Fast-Bail: not a FITS (no 'SIMPLE  ' keyword)");
+                return (result, info);
+            }
             stream.Seek(0, SeekOrigin.Begin);
+
             using (var br = new BinaryReader(stream, Encoding.ASCII, true)) // leaveOpen=true
             {
                 bool endFound = false;
                 int  blockIdx = 0;
-                while (!endFound)
+                const int blockLimit = 256; // Cap at ~737KB to prevent hangs on invalid files
+
+                while (!endFound && blockIdx < blockLimit)
                 {
                     byte[] block = br.ReadBytes(BLOCK);
                     if (block.Length < BLOCK) break;
@@ -1176,7 +1124,6 @@ public void WaitRenderTask(int timeoutMs = 2000)
                             endFound = true;
                             // data starts at the next 2880-byte boundary
                             info.DataOffset = (long)(blockIdx + 1) * BLOCK;
-                            Log($"ParseFitsStream — END at block {blockIdx} r={r}, DataOffset={info.DataOffset}");
                             break;
                         }
 
@@ -1231,6 +1178,11 @@ public void WaitRenderTask(int timeoutMs = 2000)
                     }
                     blockIdx++;
                 }
+
+                if (!endFound)
+                {
+                    if (blockIdx >= blockLimit) Log($"ParseFitsStream — WARNING: Reached limit ({blockLimit}) without END.");
+                }
             }
 
             // Defaults
@@ -1284,99 +1236,12 @@ public void WaitRenderTask(int timeoutMs = 2000)
         internal static Bitmap RenderThumbnail(Stream stream, ImageInfo info, int cx)
             => RenderImage(stream, info, System.Threading.CancellationToken.None, null, cx);
 
-        /// <summary>
+                /// <summary>
         /// Renders a static identification badge when image rendering is disabled (ShowImage=false).
         /// Encodes the frame type (LIGHT/DARK/FLAT/BIAS) via background colour and icon,
         /// and the FILTER keyword via an accent colour + text label.
         /// Zero pixel data is read — uses only the already-parsed <see cref="ImageInfo"/> metadata.
         /// </summary>
-	/*
-        internal static Bitmap RenderStaticBadge(ImageInfo info, int size)
-        {
-            string typeRaw = (info.ImageType ?? string.Empty).ToLowerInvariant().Trim();
-
-            string frameLabel;
-            Color  bgColor;
-            string iconChar;
-            bool   lightBg; // true for FLAT (bright bg → use dark ink)
-
-            if      (typeRaw.Contains("light")) { frameLabel = "LIGHT"; bgColor = Color.FromArgb( 13,  13,  26); iconChar = "\u2605"; lightBg = false; } // ★
-            else if (typeRaw.Contains("flat"))  { frameLabel = "FLAT";  bgColor = Color.FromArgb(200, 200, 200); iconChar = "\u25cf"; lightBg = true;  } // ●
-            else if (typeRaw.Contains("dark"))  { frameLabel = "DARK";  bgColor = Color.FromArgb( 26,  10,  10); iconChar = "\u25a0"; lightBg = false; } // ■
-            else if (typeRaw.Contains("bias"))  { frameLabel = "BIAS";  bgColor = Color.FromArgb( 10,  10,  20); iconChar = "\u2015"; lightBg = false; } // ―
-            else                                { frameLabel = "FITS";  bgColor = Color.FromArgb( 17,  17,  34); iconChar = "?";      lightBg = false; }
-
-            Color accentColor = GetFilterAccentColor(info.Filter);
-            Color inkColor    = lightBg ? Color.FromArgb( 40,  40,  40) : Color.FromArgb(220, 220, 235);
-            Color iconColor   = lightBg ? Color.FromArgb( 80,  80,  80) : accentColor;
-
-            // Clamp filter label to 10 chars to avoid overflow at small sizes
-            string filterLabel = string.IsNullOrEmpty(info.Filter) ? ""
-                : (info.Filter.Length > 10 ? info.Filter.Substring(0, 10) : info.Filter);
-
-            var bmp = new Bitmap(size, size, PixelFormat.Format24bppRgb);
-            try
-            {
-                using (var g = Graphics.FromImage(bmp))
-                using (var sfCenter = new StringFormat {
-                    Alignment     = StringAlignment.Center,
-                    LineAlignment = StringAlignment.Center,
-                    Trimming      = StringTrimming.EllipsisCharacter
-                })
-                {
-                    g.SmoothingMode     = SmoothingMode.AntiAlias;
-                    g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                    g.Clear(bgColor);
-
-                    // Accent stripe at the top (1/12 of height, min 4 px)
-                    int stripeH = Math.Max(4, size / 12);
-                    using (var sb = new SolidBrush(accentColor))
-                        g.FillRectangle(sb, 0, 0, size, stripeH);
-
-                    // Inset border, accent-coloured
-                    using (var pen = new Pen(Color.FromArgb(180, accentColor.R, accentColor.G, accentColor.B), 1.5f))
-                        g.DrawRectangle(pen, 1, 1, size - 3, size - 3);
-
-                    // Icon centred in the upper ~44 % below the stripe
-                    float iconPx = Math.Max(8f, size * 0.30f);
-                    using (var iconFont  = new Font("Segoe UI Symbol", iconPx, FontStyle.Regular, GraphicsUnit.Pixel))
-                    using (var iconBrush = new SolidBrush(iconColor))
-                        g.DrawString(iconChar, iconFont, iconBrush,
-                            new RectangleF(0, stripeH, size, size * 0.44f), sfCenter);
-
-                    // Frame-type label (bold)
-                    float labelPx = Math.Max(7f, size * 0.13f);
-                    using (var labelFont  = new Font("Segoe UI", labelPx, FontStyle.Bold,    GraphicsUnit.Pixel))
-                    using (var labelBrush = new SolidBrush(inkColor))
-                        g.DrawString(frameLabel, labelFont, labelBrush,
-                            new RectangleF(2, size * 0.55f, size - 4, labelPx * 1.6f), sfCenter);
-
-                    // Filter label (regular, accent colour)
-                    if (!string.IsNullOrEmpty(filterLabel))
-                    {
-                        float filterPx = Math.Max(6f, size * 0.11f);
-                        using (var filterFont  = new Font("Segoe UI", filterPx, FontStyle.Regular, GraphicsUnit.Pixel))
-                        using (var filterBrush = new SolidBrush(accentColor))
-                            g.DrawString(filterLabel, filterFont, filterBrush,
-                                new RectangleF(2, size * 0.72f, size - 4, filterPx * 1.6f), sfCenter);
-                    }
-
-                    // File-format tag anchored to the bottom — always visible so the user
-                    // can identify these as FITS files without knowing the colour code.
-                    float fitsPx = Math.Max(5f, size * 0.085f);
-                    using (var fitsFont  = new Font("Segoe UI", fitsPx, FontStyle.Regular, GraphicsUnit.Pixel))
-                    using (var fitsBrush = new SolidBrush(lightBg ? Color.FromArgb(110, 110, 110) : Color.FromArgb(80, 80, 110)))
-                        g.DrawString("FITS", fitsFont, fitsBrush,
-                            new RectangleF(0, size - fitsPx * 2f, size, fitsPx * 2f), sfCenter);
-                }
-                return bmp;
-            }
-            catch
-            {
-                bmp?.Dispose();
-                return null;
-            }
-        } */
 
     ///  <summary >
     /// Renders a "Top-Heavy" identification badge with dynamic font fitting.

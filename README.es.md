@@ -1,96 +1,105 @@
 [English (EN)](README.md) 🇬🇧 | [Español (ES)](README.es.md) 🇪🇸
 
-# FITS Windows Explorer Preview Handler
+# Extensión de Vista Previa FITS para Windows
 
-> **Previsualizador nativo de archivos FITS para el Explorador de Windows 10/11.**
+> **Visor nativo y motor de indexación de archivos FITS para el Explorador de Windows 10/11.**
 
-![Platform: Windows 10/11](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue)
+![Plataforma: Windows 10/11](https://img.shields.io/badge/Plataforma-Windows%2010%2F11-blue)
 ![.NET Framework 4.8](https://img.shields.io/badge/.NET%20Framework-4.8-purple)
-![Zero-Copy](https://img.shields.io/badge/Architecture-Zero--Copy-green)
+![Responsive](https://img.shields.io/badge/Arquitectura-Responsiva-green)
 
 ---
 
 ## ✨ Características Principales
 
-- **Arquitectura Zero-Copy**: Lee archivos FITS de varios GB instantáneamente sin copias en disco, usando streams directos (`IStream`).
-- **Proveedor de Miniaturas**: Genera miniaturas nativas en el Explorador de Windows para archivos `.fits`:
-  - **Stride Sampling**: Solo lee la fracción de píxeles necesaria para rellenar el tamaño de miniatura solicitado. Para un sensor de 4656×3520 a 256 px el stride es ≈18, por lo que únicamente se lee ~1/324 de los datos de píxeles.
-  - **No bloquea el Explorador**: El Shell invoca `GetThumbnail` en un hilo de fondo por cada archivo, en paralelo para toda una carpeta, sin interferir con la UI del Explorador.
-  - **Caché del Shell**: Las miniaturas se cachean automáticamente en `%LOCALAPPDATA%\Microsoft\Windows\Explorer\thumbcache_*.db` — el SO solo regenera una miniatura si el archivo cambia.
-  - **Modo Badge Estático**: Cuando el panel de imagen está desactivado (`ShowImage = 0`) la miniatura no lee ningún dato de píxeles. En su lugar dibuja un badge de identificación codificado por color:
-    - El fondo e icono codifican el tipo de frame (`LIGHT ★` / `DARK ■` / `FLAT ●` / `BIAS ─`).
-    - El color de acento codifica el filtro (`Hα` = rojo, `OIII` = cian, `SII` = naranja, `Hβ` = azul, bandas `L/R/G/B` = sus colores respectivos).
-    - El tipo de frame, el nombre del filtro **y la etiqueta de formato `FITS`** se muestran siempre como texto, por lo que el badge es completamente legible sin conocer el código de colores.
-- **Vista Previa de Imagen**: Renderiza el contenido del canal principal con soporte para:
-  - **Debayering Inteligente**: Downsampling 2x2 (Binning) para sensores color sin artefactos de rejilla.
-  - **Auto-Stretch Adaptativo**: Ajuste dinámico de niveles basado en Mediana/MAD para ver objetos débiles.
-  - **Tintado por Filtro**: Colorea automáticamente tomas de banda estrecha (Ha, OIII, SII) según el header.
-- **Integración con Windows Property System**: Extrae metadatos de las cabeceras FITS y los inyecta de forma nativa en el Explorador de Windows. *Nota: Solo se indexan los metadatos concretos enumerados abajo, ya que el código C# debe mapearlos contra identificadores estándar de Windows (`System.*`). No es posible indexar variables arbitrarias de FITS simplemente modificando el registro, requeriría cambiar el código fuente.*
-  - **Metadatos Mapeados e Indexados**:
-    - `System.Subject` (mapeado desde el FITS `OBJECT`)
+- **Arquitectura Responsiva**: Lee archivos FITS de varios GB instantáneamente sin copiarlos a disco.
+- **Diseño "Near-Zero Lock"**: Libera los bloqueos de archivo en milisegundos tras una fase inicial de muestreo. Puedes renombrar o mover carpetas incluso mientras la vista previa está activa.
+- **Visualización Prioritaria de Metadatos**: La tabla de cabeceras FITS aparece al instante, mientras la imagen se carga en segundo plano con información de progreso.
+- **Proveedor de Miniaturas (Thumbnails)**: Genera miniaturas nativas para archivos `.fits`:
+  - **Muestreo por Zancada (Stride)**: Solo lee los píxeles necesarios para el tamaño del icono.
+  - **Integridad Bayer**: Maneja correctamente los patrones Bayer para evitar rayas verticales.
+  - **Modo Badge estático**: Si `ShowImage=0`, las miniaturas muestran una ficha coloreada:
+    - **Fondo**: Codifica el tipo de frame (`LIGHT`=Azul oscuro, `FLAT`=Gris claro, `DARK`=Rojo oscuro, `BIAS`=Gris oscuro).
+    - **Banda Superior**: Codifica el filtro (ej: Rojo para Ha, Cian para OIII).
+    - **Etiquetas**: Texto de alto contraste con el tipo de frame y formato ("FITS").
+- **Integración con el Sistema de Propiedades**: Extrae metadatos y los inyecta nativamente en Windows.
+  - **Propiedades Mapeadas**:
+    - `System.Subject` (desde FITS `OBJECT`)
     - `System.Image.HorizontalSize` (desde `NAXIS1`)
     - `System.Image.VerticalSize` (desde `NAXIS2`)
     - `System.Image.BitDepth` (desde `BITPIX`)
-    - `System.Photo.CameraModel` (desde `INSTRUME` o `CAMERA`)
-    - `System.Photo.ExposureTime` (desde `EXPOSURE` o `EXPTIME`)
-    - `System.Category` (desde `IMAGETYP` o `FRAME` — normalizado a `Light` / `Dark` / `Flat` / `Bias`)
-  - **Visualización en el Sistema**:
-    - **InfoTip Nativo**: Mantén el ratón sobre un archivo FITS para ver una tarjeta emergente con el resumen de la captura.
-    - **Pestaña Detalles**: Pulsa `Alt+Enter` (o abre Propiedades -> Detalles) para ver los metadatos extraídos. El script de registro configura nativamente la disposición de estos datos (`FullDetails`, `InfoTip`, `PreviewDetails`).
-  - **Búsqueda Avanzada en el Explorador de Windows**:
-    Al estar indexados, Windows permite usar su Sintaxis de Consulta Avanzada (AQS) directamente en la barra de búsqueda del Explorador. Usa siempre el nombre del sistema (`System.*`) para evitar problemas de localización:
-    - **Buscar por tipo de frame** — el caso de uso más habitual:
-      | Consulta | Resultado |
-      | :--- | :--- |
-      | `System.Category:Light` | Todos los frames de luz |
-      | `System.Category:Dark` | Todos los darks |
-      | `System.Category:Flat` | Todos los flats |
-      | `System.Category:Bias` | Todos los bias |
-    - **Por cámara u objeto**: `System.Photo.CameraModel:ZWO` · `System.Subject:M31`
-    - **Rangos numéricos**: `System.Photo.ExposureTime:>120` (más de 120 s) · `System.Photo.ExposureTime:10..300`
-    - **Combinando condiciones (AND / OR — siempre en MAYÚSCULAS)**:
-      ```
-      System.Category:Dark AND System.Photo.ExposureTime:>300
-      System.Category:Light AND System.Subject:M31
-      System.Category:Flat AND System.Photo.CameraModel:"ASI2600"
-      ```
-- **Layout Dinámico**: Imagen arriba y tabla de datos abajo con altura redimensionable.
-- **Streaming Progresivo**: Muestra el progreso de lectura centrado sobre la imagen mientras se procesa el flujo de datos.
-- **Menú Contextual Integrado**: Haz clic derecho en cualquier lugar de la vista previa para configurar y exportar:
-  - **Mostrar / Ocultar Imagen**: Cambia instantáneamente entre renderizar la imagen FITS o cargar solo la matriz de metadatos ultra-rápida.
-  - **Activar / Desactivar Trazas**: Habilita los logs de diagnóstico para depuración en un clic.
-  - **Copiar Imagen**: Copia la vista auto-estirada de la imagen al portapapeles (ideal para pegar en Paint, Photoshop o mensajes).
-  - **Copiar Fila Seleccionada**: Copia exactamente la fila de metadatos seleccionada al portapapeles.
-  - **Copiar Toda la Tabla (CSV)**: Exporta todo el array del Header FITS en formato CSV (con cabeceras) al portapapeles.
+    - `System.Photo.CameraModel` (desde `CAMERA` / `INSTRUME`)
+    - `System.Photo.ExposureTime` (desde `EXPTIME` / `EXPOSURE`)
+    - `System.Category` (desde `IMAGETYP` / `FRAME` normalizado a `Light`/`Dark`/`Flat`/`Bias`)
+  - **Optimización de respuesta**: Omite archivos no válidos instantáneamente (bytes mágicos), asegurando que los Tooltips (InfoTip) sean fluidos.
+  - **Búsqueda Avanzada**: Usa AQS en la barra del Explorador para filtrar tu biblioteca:
+    | Ejemplo de Búsqueda | Resultado |
+    | :--- | :--- |
+    | `System.Category:Light` | Encuentra todos los Light frames |
+    | `System.Category:Dark` | Encuentra todos los Dark frames |
+    | `System.Category:Flat` | Encuentra todos los Flat de calibración |
+    | `System.Category:Bias` | Encuentra todos los Bias |
+    | `System.Photo.ExposureTime:>300` | Exposiciones de más de 5 minutos |
+    | `System.Subject:M31` | Tomas de la Galaxia de Andrómeda |
+    | `System.Photo.CameraModel:ASI2600` | Archivos de una cámara específica |
+    | **Combinado**: `System.Category:Light AND System.Subject:M31` | Lights de un objeto concreto |
+    | **Combinado**: `System.Category:Dark AND System.Photo.ExposureTime:300` | Darks de exactamente 300s |
+
+---
+
+## 🎨 Diseño Visual y Experiencia
+
+El panel de vista previa ha sido rediseñado para máxima productividad:
+
+1.  **Panel Superior (Dinámico)**:
+    -   Imagen con estiramiento automático (Adaptive Median/MAD).
+    -   Progreso en tiempo real (`Cargando...`, `Leyendo 45%...`) para unidades de red o nube lentas.
+2.  **Panel Inferior (Metadatos)**:
+    -   Tabla de cabeceras FITS totalmente desplazable.
+    -   Keywords coloreadas (Rojo para `END`, Amarillo para `NAXIS`, Verde para comentarios).
+3.  **Barra de Estado (Pie de página)**:
+    -   **Izquierda**: Ayuda de configuración ("Clic derecho para opciones").
+    -   **Right**: Versión de la APP y fecha/hora de compilación.
+
+---
+
+## 🖱️ Menú Contextual (Botón Derecho)
+
+Haz clic derecho en cualquier lugar del panel de vista previa:
+-   **Modos de Rendimiento**:
+    -   `Mostrar Imagen`: Renderizado de alta calidad y miniaturas reales.
+    -   `Ocultar Imagen`: Modo ultra-rápido de solo metadatos (ideal para revisar miles de ficheros).
+-   **Portapapeles y Exportación**:
+    -   `Copiar Imagen`: Genera un BMP estirado de alta calidad y lo copia al portapapeles.
+    -   `Copiar Fila Seleccionada`: Copia la línea `Keyword = Value / Comment` seleccionada.
+    -   `Copiar Tabla Completa (CSV)`: Exporta toda la cabecera FITS como un string CSV (con títulos) para Excel o Google Sheets.
+-   **Configuración y Diagnósticos**:
+    -   `Activar/Desactivar Trazas`: Controla los registros de depuración en la carpeta AppDataLow.
+
+---
+
+## 🛠️ Arquitectura
+
+### El motor SampledStream
+- **Bufferizado Selectivo**: Almacena en RAM la cabecera y unas ~600 filas de píxeles muestreadas.
+- **Liberación Temprana**: Una vez en RAM, el flujo original se **libera inmediatamente**.
+- **Filas Virtuales**: Utiliza repetición por vecino más próximo con paridad para preservar patrones Bayer durante el reescalado de miniaturas.
+
+---
 
 ## ⚙️ Configuración (Registro)
 
-La configuración se gestiona fácilmente desde el propio **Menú Contextual (Clic derecho)** en la ventana de previsualización, sin necesidad de tocar `regedit.exe`. Los cambios surten efecto al instante.
-
-Para automatizaciones o despliegues, las claves de registro se almacenan de forma segura en la zona de Baja Integridad (Low-IL):
-
-### Nivel de Usuario (Recomendado)
-`HKEY_CURRENT_USER\Software\AppDataLow\FitsPreviewHandler`
-
-### Nivel Global (Predeterminado)
-`HKEY_LOCAL_MACHINE\Software\AppDataLow\FitsPreviewHandler`
+La extensión comprueba los ajustes en este orden:
+1.  **Usuario Local**: `HKEY_CURRENT_USER\Software\AppDataLow\FitsPreviewHandler`
+2.  **Máquina Global**: `HKEY_LOCAL_MACHINE\Software\AppDataLow\FitsPreviewHandler`
 
 | Valor (DWORD) | Descripción |
 | :--- | :--- |
-| `ShowImage` | `1` (Muestra imagen y tabla + miniatura real con píxeles), `0` (Solo tabla + miniatura badge estático). |
-| `EnableTracing` | `1` (Activa logs de depuración), `0` (Desactiva). |
+| `ShowImage` | `1` (Renderizar imagen), `0` (Solo metadatos). |
+| `EnableTracing` | `1` (Activa registros en AppDataLow). |
 
 ---
 
-## 🚀 Instalación (Como Administrador)
-
-1.  Compila el proyecto con `dotnet build -c Release`.
-2.  Ejecuta `register.bat` para dar de alta el componente en el sistema.
-3.  Si necesitas desinstalar, usa `unregister.bat`.
-
----
-
-## 🔍 Diagnóstico (Logs)
-
-Los logs se guardan en la zona de baja integridad para cumplir con las restricciones de `prevhost.exe`:
-`%USERPROFILE%\AppData\LocalLow\FitsPreviewHandler\fits_trace.log`
+## 🚀 Instalación y Diagnósticos
+1.  Ejecutar `register.bat` como Administrador.
+2.  Logs: `%USERPROFILE%\AppData\LocalLow\FitsPreviewHandler\fits_trace.log`
