@@ -156,10 +156,12 @@ namespace FitsPreviewHandler
             }
         }
 
+        private static readonly int _pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+
         internal static void Log(string msg)
         {
             if (!Settings.EnableTracing) return;
-            msg = $"[{DateTime.Now:HH:mm:ss.fff}] [UI] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {msg}";
+            msg = $"[{DateTime.Now:HH:mm:ss.fff}] [PID:{_pid}] [UI] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {msg}";
             System.Diagnostics.Debug.WriteLine(msg);
             try
             {
@@ -211,30 +213,32 @@ namespace FitsPreviewHandler
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing)
+            Log($"Dispose({disposing}).BEGIN");
+            try
             {
-                Log("FitsPreviewControl.Dispose — cancelling async tasks");
-                lock (_syncRoot)
+                if (disposing)
                 {
-                    if (_cts != null)
+                    lock (_syncRoot)
                     {
-                        _cts.Cancel();
-                        _cts.Dispose();
-                        _cts = null;
+                        if (_cts != null)
+                        {
+                            _cts.Cancel();
+                            // We don't wait for the task anymore (Fire & Forget).
+                            // The task's finally block will handle cleanup.
+                            _cts.Dispose();
+                            _cts = null;
+                        }
+                    }
+                    
+                    if (_pictureBox.Image != null)
+                    {
+                        try { _pictureBox.Image.Dispose(); } catch {}
+                        _pictureBox.Image = null;
                     }
                 }
-                
-                // Ensure the background task is finished before we fully dispose
-                // to avoid COM stream access violations during Unload.
-                _imageLoadTask?.Wait(2000);
-                
-                if (_pictureBox.Image != null)
-                {
-                    _pictureBox.Image.Dispose();
-                    _pictureBox.Image = null;
-                }
             }
-            base.Dispose(disposing);
+            catch (Exception ex) { Log("Dispose EXCEPTION: " + ex); }
+            finally { base.Dispose(disposing); Log("Dispose.END"); }
         }
 
         private void InitializeComponent()
@@ -546,35 +550,36 @@ namespace FitsPreviewHandler
         } 
         public void LoadFits(Stream stream, string fileName, bool ownsStream = false, List<(string, string, string)> preParsedKeywords = null, ImageInfo? preParsedInfo = null)
         {
-            Log($"LoadFits(Stream) — '{fileName}'");
-
-            bool showImg = Settings.ShowImage;
-            bool logOn   = Settings.EnableTracing;
-
-            Action updateLayout = () => {
-                _pictureBox.Visible = showImg;
-                _split.Panel1Collapsed = !showImg;
-                if (!showImg) _lblProgress.Visible = false;
-                _lblImageHint.Text = Strings.RightClickHint;
-                _lblImageHint.Visible = true;
-                _lblLogStatus.Text = Strings.LogStatus(logOn);
-                _lblLogStatus.ForeColor = logOn ? Color.FromArgb(150, 255, 150) : Color.FromArgb(120, 120, 140);
-            };
-
-            if (InvokeRequired) Invoke(updateLayout); else updateLayout();
-
+            Log($"LoadFits.BEGIN — '{fileName}' (owns={ownsStream})");
             try
             {
+                bool showImg = Settings.ShowImage;
+                bool logOn   = Settings.EnableTracing;
+
+                Action updateLayout = () => {
+                    _pictureBox.Visible = showImg;
+                    _split.Panel1Collapsed = !showImg;
+                    if (!showImg) _lblProgress.Visible = false;
+                    _lblImageHint.Text = Strings.RightClickHint;
+                    _lblImageHint.Visible = true;
+                    _lblLogStatus.Text = Strings.LogStatus(logOn);
+                    _lblLogStatus.ForeColor = logOn ? Color.FromArgb(150, 255, 150) : Color.FromArgb(120, 120, 140);
+                };
+
+                if (InvokeRequired) Invoke(updateLayout); else updateLayout();
+
                 List<(string, string, string)> rows;
                 ImageInfo info;
 
                 if (preParsedKeywords != null && preParsedInfo.HasValue)
                 {
+                    Log("  Using pre-parsed keywords/info");
                     rows = preParsedKeywords;
                     info = preParsedInfo.Value;
                 }
                 else
                 {
+                    Log("  Parsing stream...");
                     (rows, info) = ParseFitsStream(stream);
                 }
 
@@ -584,24 +589,23 @@ namespace FitsPreviewHandler
                 if (showImg && info.HasImage && !IsDisposed)
                 {
                     CancelOldLoad();
-                    StartImageLoad(stream, info, _cts.Token, ownsStream);
-                    ownsStream = false; // task now owns it
+                    // Task starts, samples the stream, then releases it immediately
+                    StartImageLoad(stream, info, _cts.Token, fileName, ownsStream);
                 }
                 else
                 {
-                    if (!showImg) Log("LoadFits — image loading disabled in registry");
-                    else if (!info.HasImage) Log("LoadFits — no image data to display");
-                    
-                    // If no image task, we must dispose now if we own it
-                    if (ownsStream) { try { stream.Dispose(); } catch { } ownsStream = false; }
+                    if (ownsStream) { try { stream.Dispose(); } catch {} }
+                    if (!showImg) Log("  Image loading disabled in registry");
+                    else if (!info.HasImage) Log("  No image data found in header");
                 }
             }
             catch (Exception ex)
             {
-                Log("LoadFits(Stream) — EXCEPTION: " + ex);
+                Log("LoadFits EXCEPTION: " + ex);
                 ShowError(Strings.ErrorReadingStream + ex.Message);
                 if (ownsStream) try { stream.Dispose(); } catch { }
             }
+            finally { Log("LoadFits.END"); }
         }
 
         // ── Grid population ─────────────────────────────────────────────
@@ -635,22 +639,21 @@ namespace FitsPreviewHandler
         }
 
         // ── Async image load ────────────────────────────────────────────
-        private void StartImageLoad(Stream stream, ImageInfo info, System.Threading.CancellationToken token, bool ownsStream = false)
+        private void StartImageLoad(Stream stream, ImageInfo info, System.Threading.CancellationToken token, string fileName, bool ownsStream = false)
         {
+            Log("StartImageLoad.BEGIN");
             _imageLoadTask = Task.Run(() =>
             {
+                Log("  Background Task — started");
                 try
                 {
-                    if (token.IsCancellationRequested) { if (ownsStream) stream.Dispose(); return; }
+                    if (token.IsCancellationRequested) { Log("  Background Task — cancelled before start"); if (ownsStream) stream.Dispose(); return; }
 
-                    // 1. If we are reading from a COM stream or FileStream, 
-                    //    first convert it into a COMPACT SampledStream in memory 
-                    //    and release the source handle IMMEDIATELY. 
-                    //    Total metadata + pixels for preview (600 rows) is usually < 10 MB.
                     Stream sourceStream = stream;
                     if (!(stream is SampledStream))
                     {
-                        void BufferReport(string msg) => BeginInvoke(new Action(() => {
+                        Log("  Background Task — creating SampledStream...");
+                        void BufferReport(string msg) => TryBeginInvoke(new Action(() => {
                             if (!IsDisposed && _cts != null && !_cts.IsCancellationRequested) {
                                 _lblProgress.Text = msg;
                                 _lblProgress.Visible = true;
@@ -661,19 +664,17 @@ namespace FitsPreviewHandler
                         int targetDim = 600;
                         var ss = new SampledStream(info.Width, info.Height, info.BitPix, info.DataOffset);
                         
-                        // Clone header
                         sourceStream.Seek(0, SeekOrigin.Begin);
                         byte[] hbuf = new byte[info.DataOffset > 0 ? info.DataOffset : 2880];
                         sourceStream.Read(hbuf, 0, hbuf.Length);
                         ss.WriteSample(0, hbuf);
 
-                        // Capture sampled rows
                         double aspect = (double)info.Width / info.Height;
                         int outW = info.Width >= info.Height ? Math.Min(info.Width, targetDim) : Math.Max(1, (int)(Math.Min(info.Height, targetDim) * aspect));
                         int outH = info.Width >= info.Height ? Math.Max(1, (int)(outW / aspect)) : Math.Min(info.Height, targetDim);
                         bool isBayer = !string.IsNullOrEmpty(info.BayerPattern) && info.Planes == 1;
                         int sy = Math.Max(1, info.Height / outH);
-                        if (isBayer) sy = (sy / 2) * 2; // Keep Bayer pairs together
+                        if (isBayer) sy = (sy / 2) * 2;
                         if (sy < 1) sy = 1;
 
                         int bpp = info.BytesPerPixel;
@@ -700,6 +701,7 @@ namespace FitsPreviewHandler
                         }
                         
                         if (token.IsCancellationRequested) {
+                            Log("  Background Task — cancelled during sampling");
                             if (ownsStream) sourceStream.Dispose();
                             ss.Dispose();
                             return;
@@ -708,33 +710,47 @@ namespace FitsPreviewHandler
                         ss.Position = 0;
                         if (ownsStream) sourceStream.Dispose();
                         sourceStream = ss;
-                        Log($"  Render switched to SampledStream ({ss.BufferedBytes/1024} KB). Source handle released.");
+                        Log($"  Background Task — switched to SampledStream ({ss.BufferedBytes/1024} KB).");
                     }
 
-                    void Report(string msg) => BeginInvoke(new Action(() => {
+                    void Report(string msg) => TryBeginInvoke(new Action(() => {
                         if (!IsDisposed && _cts != null && !_cts.IsCancellationRequested) {
                             _lblProgress.Text = msg;
                             _lblProgress.Visible = true;
                         }
                     }));
 
+                    Log("  Background Task — calling RenderImage...");
                     Bitmap bmp = RenderImage(sourceStream, info, token, Report, maxDim: 600);
                     if (bmp != null && !token.IsCancellationRequested && !IsDisposed)
                     {
-                        BeginInvoke(new Action(() =>
+                        TryBeginInvoke(new Action(() =>
                         {
-                            if (_pictureBox.Image != null) { _pictureBox.Image.Dispose(); _pictureBox.Image = null; }
+                            if (_pictureBox.Image != null) { try { _pictureBox.Image.Dispose(); } catch {} _pictureBox.Image = null; }
                             _pictureBox.Image = bmp;
                             _pictureBox.Visible = true;
                             _lblProgress.Visible = false;
                         }));
+                        Log("  Background Task — image rendered and posted to UI");
                     }
                     else if (bmp != null) bmp.Dispose();
                     
                     if (sourceStream is SampledStream) sourceStream.Dispose();
                 }
-                catch (Exception ex) { if (!token.IsCancellationRequested) Log("StartImageLoad EXCEPTION: " + ex); }
+                catch (Exception ex) { if (!token.IsCancellationRequested) Log("Background Task EXCEPTION: " + ex); }
+                finally 
+                { 
+                    Log("  Background Task — finished"); 
+                    // Now that we have the full image, let Explorer update the thumbnail
+                    NotifyFileChanged(fileName);
+                }
             });
+            Log("StartImageLoad.END");
+        }
+
+        private void TryBeginInvoke(Action action)
+        {
+            try { if (!IsDisposed && IsHandleCreated) BeginInvoke(action); } catch {}
         }
 
 public void WaitRenderTask(int timeoutMs = 2000)
@@ -750,33 +766,44 @@ public void WaitRenderTask(int timeoutMs = 2000)
 
 
         // ── Rendering pipeline ──────────────────────────────────────────
-        private static Bitmap RenderImage(Stream stream, ImageInfo info, System.Threading.CancellationToken token, Action<string> reportProgress = null, int maxDim = 2000)
+        private static Bitmap RenderImage(Stream stream, ImageInfo info, System.Threading.CancellationToken token, Action<string> reportProgress = null, int maxDim = 2000, bool disposeSourceAfterRead = false)
         {
-            int MAX_DIM = maxDim; // Default 2000 for the preview panel; pass cx for thumbnail generation
-            double aspect = (double)info.Width / info.Height;
-            int outW, outH;
-            if (info.Width >= info.Height)
-            { outW = Math.Min(info.Width, MAX_DIM); outH = Math.Max(1, (int)(outW / aspect)); }
-            else
-            { outH = Math.Min(info.Height, MAX_DIM); outW = Math.Max(1, (int)(outH * aspect)); }
+            try {
+                int MAX_DIM = maxDim; 
+                double aspect = (double)info.Width / info.Height;
+                int outW, outH;
+                if (info.Width >= info.Height)
+                { outW = Math.Min(info.Width, MAX_DIM); outH = Math.Max(1, (int)(outW / aspect)); }
+                else
+                { outH = Math.Min(info.Height, MAX_DIM); outW = Math.Max(1, (int)(outH * aspect)); }
 
-            Log($"RenderImage — target {outW}×{outH}");
+                Log($"RenderImage.BEGIN — target {outW}×{outH}");
 
-            // Read color/mono data
-            float[][] planes = ReadAllPlanes(stream, info, outW, outH, out int aW, out int aH, token, reportProgress);
-            if (token.IsCancellationRequested) return null;
-            Log($"RenderImage — planes={planes.Length} actual={aW}×{aH}");
+                // 1. READ phase (IO intensive, holds the lock)
+                float[][] planes = ReadAllPlanes(stream, info, outW, outH, out int aW, out int aH, token, reportProgress);
+                
+                // 2. CRITICAL: Release the file lock as soon as bytes are in memory
+                if (disposeSourceAfterRead) {
+                    Log("  RenderImage — Read done, releasing source stream handle...");
+                    try { stream.Dispose(); } catch { }
+                }
 
-            if (planes.Length >= 3)
-                return PlanesToColorBitmap(planes[0], planes[1], planes[2], aW, aH, token);
+                if (token.IsCancellationRequested || planes == null) return null;
+                Log($"RenderImage — planes={planes.Length} actual={aW}×{aH}");
 
-            // Mono/Narrowband
-            AdaptiveStretch(planes[0], out float low, out float high);
-            if (token.IsCancellationRequested) return null;
-            Log($"RenderImage — stretch low={low:G4} high={high:G4}");
+                // 3. PROCESS phase (CPU intensive, file is already UNLOCKED)
+                if (planes.Length >= 3)
+                    return PlanesToColorBitmap(planes[0], planes[1], planes[2], aW, aH, token);
 
-            Color tint = GetFilterTint(info.Filter);
-            return PixelsToBitmap(planes[0], aW, aH, low, high, tint);
+                AdaptiveStretch(planes[0], out float low, out float high);
+                if (token.IsCancellationRequested) return null;
+                
+                Color tint = GetFilterTint(info.Filter);
+                return PixelsToBitmap(planes[0], aW, aH, low, high, tint);
+            }
+            finally {
+                if (disposeSourceAfterRead) { try { stream.Dispose(); } catch { } }
+            }
         }
 
         private static float[][] ReadAllPlanes(
@@ -786,91 +813,124 @@ public void WaitRenderTask(int timeoutMs = 2000)
             System.Threading.CancellationToken token,
             Action<string> reportProgress = null)
         {
-            // If Bayer, we will produce 3 planes (RGB) directly during downsampling
-            bool isBayer = !string.IsNullOrEmpty(info.BayerPattern) && info.Planes == 1;
-
-            int sx = Math.Max(1, info.Width  / targetW);
-            int sy = Math.Max(1, info.Height / targetH);
-
-            // For Bayer, we MUST ensure step is even (2x2 cells)
-            if (isBayer) {
-                sx = (sx < 2) ? 2 : (sx % 2 != 0 ? sx + 1 : sx);
-                sy = (sy < 2) ? 2 : (sy % 2 != 0 ? sy + 1 : sy);
-            }
-
-            actualW = 0; for (int x = 0; x <= info.Width - (isBayer ? 2 : 1);  x += sx) actualW++;
-            actualH = 0; for (int y = 0; y <= info.Height - (isBayer ? 2 : 1); y += sy) actualH++;
-            Log($"ReadAllPlanes — {info.Width}x{info.Height} stride {sx}x{sy} -> {actualW}x{actualH} (Bayer:{isBayer})");
-
-            int bpp = info.BytesPerPixel;
-            long rowBytes = (long)info.Width * bpp;
-            
-            int outPlanes = isBayer ? 3 : info.Planes;
-            float[][] planes = new float[outPlanes][];
-            for (int p = 0; p < outPlanes; p++) planes[p] = new float[actualW * actualH];
-
-            byte[] rowBuf = new byte[rowBytes];
-            byte[] nextRowBuf = isBayer ? new byte[rowBytes] : null;
-
-            for (int p = 0; p < info.Planes && p < (isBayer ? 1 : outPlanes); p++)
+            try
             {
-                long planeOff = info.DataOffset + (long)p * info.Height * rowBytes;
-                int outY = 0;
-                for (int y = 0; y <= info.Height - (isBayer ? 2 : 1) && outY < actualH; y += sy)
+                bool isBayer = !string.IsNullOrEmpty(info.BayerPattern) && info.Planes == 1;
+                int sx = Math.Max(1, info.Width / targetW);
+                int sy = Math.Max(1, info.Height / targetH);
+
+                if (isBayer) {
+                    sx = (sx < 2) ? 2 : (sx % 2 != 0 ? sx + 1 : sx);
+                    sy = (sy < 2) ? 2 : (sy % 2 != 0 ? sy + 1 : sy);
+                }
+
+                actualW = 0; for (int x = 0; x <= info.Width - (isBayer ? 2 : 1); x += sx) actualW++;
+                actualH = 0; for (int y = 0; y <= info.Height - (isBayer ? 2 : 1); y += sy) actualH++;
+
+                int bpp = info.BytesPerPixel;
+                long rowBytes = (long)info.Width * bpp;
+                int outPlanes = isBayer ? 3 : info.Planes;
+
+                float[][] planes = new float[outPlanes][];
+                for (int p = 0; p < outPlanes; p++) planes[p] = new float[actualW * actualH];
+
+                for (int p = 0; p < info.Planes && p < (isBayer ? 1 : outPlanes); p++)
                 {
-                    if (token.IsCancellationRequested) break;
-
-                    if (y % (sy * 20) == 0) // Report progress every 20 output rows
-                    {
-                        double progress = 100.0 * (p * info.Height + y) / (info.Planes * info.Height);
-                        reportProgress?.Invoke(Strings.RenderProgress(progress));
-                    }
-
-                    stream.Seek(planeOff + (long)y * rowBytes, SeekOrigin.Begin);
-                    stream.Read(rowBuf, 0, (int)rowBytes);
+                    long planeOff = info.DataOffset + (long)p * info.Height * rowBytes;
+                    long lastY = (long)(actualH - 1) * sy + (isBayer ? 1 : 0);
+                    if (lastY >= info.Height) lastY = info.Height - 1;
                     
-                    if (isBayer) {
-                        stream.Seek(planeOff + (long)(y+1) * rowBytes, SeekOrigin.Begin);
-                        stream.Read(nextRowBuf, 0, (int)rowBytes);
-                    }
+                    long start = planeOff;
+                    long end = planeOff + (lastY * rowBytes) + rowBytes;
+                    long totalRange = end - start;
 
-                    int outX = 0;
-                    for (int x = 0; x <= info.Width - (isBayer ? 2 : 1) && outX < actualW; x += sx)
+                    if (totalRange > 0 && totalRange < 32 * 1024 * 1024)
                     {
-                        int idx = (actualH - 1 - outY) * actualW + outX;
-
-                        if (isBayer) {
-                            double p00 = ReadRaw(rowBuf, x * bpp, info.BitPix);
-                            double p10 = ReadRaw(rowBuf, (x+1) * bpp, info.BitPix);
-                            double p01 = ReadRaw(nextRowBuf, x * bpp, info.BitPix);
-                            double p11 = ReadRaw(nextRowBuf, (x+1) * bpp, info.BitPix);
-                            
-                            float r, g, b;
-                            string pat = info.BayerPattern.ToUpper();
-                            if (pat == "RGGB") {
-                                r=(float)p00; g=(float)(p10+p01)/2f; b=(float)p11;
-                            } else if (pat == "GRBG") {
-                                g=(float)(p00+p11)/2f; r=(float)p10; b=(float)p01;
-                            } else if (pat == "GBRG") {
-                                g=(float)(p00+p11)/2f; b=(float)p10; r=(float)p01;
-                            } else { // BGGR
-                                b=(float)p00; g=(float)(p10+p01)/2f; r=(float)p11; 
-                            }
-
-                            planes[0][idx] = (float)(r * info.BScale + info.BZero);
-                            planes[1][idx] = (float)(g * info.BScale + info.BZero);
-                            planes[2][idx] = (float)(b * info.BScale + info.BZero);
+                        Log($"  ReadAllPlanes — Block read {totalRange / 1024} KB...");
+                        byte[] block = new byte[totalRange];
+                        stream.Seek(start, SeekOrigin.Begin);
+                        int read = 0; while(read < totalRange) {
+                            int r = stream.Read(block, read, (int)(totalRange - read));
+                            if (r <= 0) break; read += r;
                         }
-                        else {
-                            double raw = ReadRaw(rowBuf, x * bpp, info.BitPix);
-                            planes[p][idx] = (float)(raw * info.BScale + info.BZero);
+
+                        int outY = 0;
+                        for (int y = 0; y <= info.Height - (isBayer ? 2 : 1) && outY < actualH; y += sy)
+                        {
+                            if (token.IsCancellationRequested) return null;
+                            int rowOff = (int)((long)y * rowBytes);
+                            FillRow(planes, outY, actualW, block, rowOff, (int)(rowOff + rowBytes), info, sx, actualH, isBayer, p);
+                            outY++;
                         }
-                        outX++;
                     }
-                    outY++;
+                    else
+                    {
+                        Log($"  ReadAllPlanes — Range {totalRange/1024/1024}MB too large, using row-skipping.");
+                        byte[] rowBuf = new byte[rowBytes];
+                        byte[] nextRowBuf = isBayer ? new byte[rowBytes] : null;
+                        int outY = 0;
+                        for (int y = 0; y <= info.Height - (isBayer ? 2 : 1) && outY < actualH; y += sy)
+                        {
+                            if (token.IsCancellationRequested) break;
+                            stream.Seek(planeOff + (long)y * rowBytes, SeekOrigin.Begin);
+                            stream.Read(rowBuf, 0, (int)rowBytes);
+                            if (isBayer) {
+                                stream.Seek(planeOff + (long)(y+1) * rowBytes, SeekOrigin.Begin);
+                                stream.Read(nextRowBuf, 0, (int)rowBytes);
+                            }
+                            
+                            FillRow(planes, outY, actualW, rowBuf, 0, 0, info, sx, actualH, isBayer, p, nextRowBuf);
+                            outY++;
+                        }
+                    }
+                }
+                return planes;
+            }
+            catch (Exception ex) { 
+                Log("ReadAllPlanes (Block) ERROR: " + ex); 
+                actualW = 0; actualH = 0;
+                return null; 
+            }
+        }
+
+        private static void FillRow(float[][] planes, int outY, int outW, byte[] buffer, int offset, int nextRowOffset, ImageInfo info, int sx, int actualH, bool isBayer, int p, byte[] nextRowBuffer = null)
+        {
+            int bpp = info.BytesPerPixel;
+            int outIdxBase = (actualH - 1 - outY) * outW;
+            string pat = (info.BayerPattern ?? "RGGB").ToUpper();
+            
+            for (int x = 0; x < outW; x++)
+            {
+                int targetX = x * sx;
+                int pxOff = offset + (targetX * bpp);
+                
+                if (isBayer)
+                {
+                    double p00 = ReadRaw(buffer, pxOff, info.BitPix);
+                    double p10 = ReadRaw(buffer, pxOff + bpp, info.BitPix);
+                    
+                    byte[] b2 = nextRowBuffer ?? buffer;
+                    int off2 = nextRowBuffer != null ? (targetX * bpp) : nextRowOffset + (targetX * bpp);
+                    
+                    double p01 = ReadRaw(b2, off2, info.BitPix);
+                    double p11 = ReadRaw(b2, off2 + bpp, info.BitPix);
+                    
+                    float r, g, b;
+                    if (pat == "RGGB") { r=(float)p00; g=(float)(p10+p01)/2f; b=(float)p11; }
+                    else if (pat == "GRBG") { g=(float)(p00+p11)/2f; r=(float)p10; b=(float)p01; }
+                    else if (pat == "GBRG") { g=(float)(p00+p11)/2f; b=(float)p10; r=(float)p01; }
+                    else { b=(float)p00; g=(float)(p10+p01)/2f; r=(float)p11; }
+
+                    planes[0][outIdxBase + x] = (float)(r * info.BScale + info.BZero);
+                    planes[1][outIdxBase + x] = (float)(g * info.BScale + info.BZero);
+                    planes[2][outIdxBase + x] = (float)(b * info.BScale + info.BZero);
+                }
+                else
+                {
+                    double raw = ReadRaw(buffer, pxOff, info.BitPix);
+                    planes[p][outIdxBase + x] = (float)(raw * info.BScale + info.BZero);
                 }
             }
-            return planes;
         }
 
         // ── Big-endian pixel reader (all BITPIX variants) ───────────────
@@ -1233,8 +1293,8 @@ public void WaitRenderTask(int timeoutMs = 2000)
         /// For a 4656-wide sensor at cx=256 the stride is ~18, so only ≈1/324th of the pixel
         /// data is read — the rest of the file is never touched.
         /// </summary>
-        internal static Bitmap RenderThumbnail(Stream stream, ImageInfo info, int cx)
-            => RenderImage(stream, info, System.Threading.CancellationToken.None, null, cx);
+        internal static Bitmap RenderThumbnail(Stream stream, ImageInfo info, int cx, bool ownsStream = false)
+            => RenderImage(stream, info, System.Threading.CancellationToken.None, null, cx, disposeSourceAfterRead: ownsStream);
 
                 /// <summary>
         /// Renders a static identification badge when image rendering is disabled (ShowImage=false).
@@ -1397,6 +1457,23 @@ public void WaitRenderTask(int timeoutMs = 2000)
                 _txtError.Text      = message;
             }
             if (InvokeRequired) BeginInvoke(new Action(Show)); else Show();
+        }
+
+        [DllImport("shell32.dll")]
+        private static extern void SHChangeNotify(int wEventId, int uFlags, IntPtr dwItem1, IntPtr dwItem2);
+        
+        public static void NotifyFileChanged(string path)
+        {
+            if (string.IsNullOrEmpty(path) || path == "FITS Stream") return;
+            try 
+            {
+                IntPtr pidl = IntPtr.Zero;
+                // SHCNE_UPDATEITEM = 0x00002000, SHCNF_PATHW = 0x0005
+                IntPtr pathPtr = Marshal.StringToCoTaskMemUni(path);
+                SHChangeNotify(0x2000, 0x0005, pathPtr, IntPtr.Zero);
+                Marshal.FreeCoTaskMem(pathPtr);
+            }
+            catch { }
         }
     }
 }

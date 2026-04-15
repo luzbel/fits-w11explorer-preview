@@ -13,7 +13,9 @@
 ## ✨ Características Principales
 
 - **Arquitectura Responsiva**: Lee archivos FITS de varios GB instantáneamente sin copiarlos a disco.
-- **Diseño "Near-Zero Lock"**: Libera los bloqueos de archivo en milisegundos tras una fase inicial de muestreo. Puedes renombrar o mover carpetas incluso mientras la vista previa está activa.
+- **E/S Optimizada para la Nube**: Utiliza una estrategia de **Lectura en Bloque (32MB)** para minimizar el tráfico de red en almacenamientos de alta latencia (pCloud, OneDrive, NAS).
+- **Diseño "Instant Release"**: Libera los bloqueos de archivo en milisegundos tras la lectura. Puedes renombrar o mover carpetas incluso mientras el renderizado de alta resolución se procesa en RAM.
+- **Navegación sin Esperas**: La descarga asíncrona asegura **0ms de retraso** al desplazarte por cientos de archivos con las flechas del teclado.
 - **Visualización Prioritaria de Metadatos**: La tabla de cabeceras FITS aparece al instante, mientras la imagen se carga en segundo plano con información de progreso.
 - **Proveedor de Miniaturas (Thumbnails)**: Genera miniaturas nativas para archivos `.fits`:
   - **Muestreo por Zancada (Stride)**: Solo lee los píxeles necesarios para el tamaño del icono.
@@ -21,7 +23,9 @@
   - **Modo Badge estático**: Si `ShowImage=0`, las miniaturas muestran una ficha coloreada:
     - **Fondo**: Codifica el tipo de frame (`LIGHT`=Azul oscuro, `FLAT`=Gris claro, `DARK`=Rojo oscuro, `BIAS`=Gris oscuro).
     - **Banda Superior**: Codifica el filtro (ej: Rojo para Ha, Cian para OIII).
-    - **Etiquetas**: Texto de alto contraste con el tipo de frame y formato ("FITS").
+  - **Detección de Latencia**: Mide el tiempo de respuesta del disco. Si es >200ms (nube sin caché), muestra un **Badge** al instante para evitar que el Explorador se cuelgue.
+  - **Actualización Automática**: Al ver un archivo en el Panel de Vista Previa, se fuerza el refresco de su miniatura para pasar de "Badge" a "Foto" una vez hidratado en disco.
+  - **Etiquetas**: Texto de alto contraste con el tipo de frame y formato ("FITS").
 - **Integración con el Sistema de Propiedades**: Extrae metadatos y los inyecta nativamente en Windows.
   - **Propiedades Mapeadas**:
     - `System.Subject` (desde FITS `OBJECT`)

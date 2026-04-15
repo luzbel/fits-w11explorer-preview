@@ -4,6 +4,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Collections.Generic;
+using System.Text;
+using System.Threading.Tasks;
 using Microsoft.Win32;
 
 namespace FitsPreviewHandler
@@ -128,43 +130,59 @@ namespace FitsPreviewHandler
         private System.Threading.Thread      _uiThread;
 
         // Metadata is populated eagerly at Initialize time (header-only read, a few KB).
-        // It is never re-read after Initialize returns. All IPropertyStore and
-        // IThumbnailProvider (badge) calls read from this cache only — zero I/O.
         private ImageInfo? _metadata;
         private List<(string, string, string)> _keywords;
 
-        // Render stream used exclusively by DoPreview's render pipeline.
-        // Lifetime: created in DoPreview → passed to LoadFits(ownsStream=true)
-        //           → disposed by the render task's finally block as soon as
-        //           pixel sampling completes (success, cancel, or error).
-        // After that point no file handle is held, so the Shell can open the
-        // file freely for the Details pane, Alt+Enter Properties, etc.
-        //
         // COM IStream stored if InitializeWithStream is used.
-        // It is held until DoPreview consumes it or Unload disposes it.
         private object _comStream;
+        private bool   _isSlowLink;
+
+        private static readonly int _pid = System.Diagnostics.Process.GetCurrentProcess().Id;
 
         // ── Logging ─────────────────────────────────────────────────────
-        private static void Log(string msg, bool force = false)
+        private void Log(string msg, bool force = false)
         {
             if (!force && !Settings.EnableTracing) return;
-            msg = $"[{DateTime.Now:HH:mm:ss.fff}] [Ext] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {msg}";
+            string inst = $"[Inst:{this.GetHashCode():X8}]";
+            msg = $"[{DateTime.Now:HH:mm:ss.fff}] [PID:{_pid}] [Ext] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] {inst} {msg}";
+            System.Diagnostics.Debug.WriteLine(msg);
+            try { File.AppendAllText(FitsPreviewControl.LogPath, msg + "\n"); } catch { }
+        }
+
+        private static void LogStatic(string msg)
+        {
+            if (!Settings.EnableTracing) return;
+            msg = $"[{DateTime.Now:HH:mm:ss.fff}] [PID:{_pid}] [Ext] [T{System.Threading.Thread.CurrentThread.ManagedThreadId}] [Static] {msg}";
             System.Diagnostics.Debug.WriteLine(msg);
             try { File.AppendAllText(FitsPreviewControl.LogPath, msg + "\n"); } catch { }
         }
 
         static FitsPreviewHandlerExtension()
         {
-            Log("--- CLASS LOADED ---", true);
+            LogStatic("--- CLASS LOADED ---");
             AppDomain.CurrentDomain.UnhandledException +=
-                (s, e) => Log("!!! UNHANDLED: " + e.ExceptionObject, true);
+                (s, e) => LogStatic("!!! UNHANDLED: " + e.ExceptionObject);
         }
 
         public FitsPreviewHandlerExtension() => Log("=== constructor ===");
 
+        ~FitsPreviewHandlerExtension()
+        {
+            Log("=== destructor ===");
+            try { ReleaseStream(); } catch { }
+        }
+
+        private void ReleaseStream()
+        {
+            if (_comStream != null)
+            {
+                Log($"  Releasing COM stream {(_comStream?.GetHashCode() ?? 0):X8}...");
+                try { Marshal.ReleaseComObject(_comStream); } catch { }
+                _comStream = null;
+            }
+        }
+
         // ── ParseHeaderFromFile ─────────────────────────────────────────
-        // Opens the file, reads only until the END keyword (a few KB), closes.
-        // File handle lifetime < 1 ms. Folder rename is never blocked.
         private static ImageInfo? ParseHeaderFromFile(string path)
         {
             try
@@ -173,112 +191,74 @@ namespace FitsPreviewHandler
                                                FileShare.ReadWrite | FileShare.Delete))
                 {
                     var (_, info) = FitsPreviewControl.ParseFitsStream(fs);
-                    Log($"ParseHeaderFromFile — {info.Width}x{info.Height} BITPIX={info.BitPix}");
                     return info;
                 }
             }
-            catch (Exception ex) { Log($"ParseHeaderFromFile failed: {ex.Message}"); return null; }
+            catch (Exception ex) { LogStatic($"ParseHeaderFromFile failed: {ex.Message}"); return null; }
         }
 
         // ── IInitializeWithFile ─────────────────────────────────────────
-        // Called by: Explorer preview pane (file path available), SearchIndexer,
-        // Details pane, InfoTip. Most common activation path.
         public void Initialize(string pszFilePath, uint grfMode)
         {
-            Log($"IInitializeWithFile — '{pszFilePath}'");
-            _filePath    = pszFilePath;
-            _comStream   = null;
-            _keywords    = null;
-            _metadata    = null;
+            Log($"IInitializeWithFile.BEGIN — '{pszFilePath}' (mode={grfMode})");
+            try
+            {
+                _filePath    = pszFilePath;
+                _comStream   = null;
+                _keywords    = null;
+                _metadata    = null;
 
-            try {
-                using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+                // Header-only parse (fast, closed immediately)
+                using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
                     var (rows, info) = FitsPreviewControl.ParseFitsStream(fs);
+                    sw.Stop();
                     _keywords = rows;
                     _metadata = info;
+                    _isSlowLink = sw.ElapsedMilliseconds > 200;
+                    Log($"  Header parsed OK: {info.Width}x{info.Height} (Lat={sw.ElapsedMilliseconds}ms, Slow={_isSlowLink})");
                 }
-            } catch (Exception ex) { Log($"IInitializeWithFile Header Read failed: {ex.Message}"); }
+            }
+            catch (Exception ex) { Log($"IInitializeWithFile ERROR: {ex.Message}"); }
+            finally { Log("IInitializeWithFile.END"); }
         }
 
         // ── IInitializeWithStream ───────────────────────────────────────
-        // Called by: Explorer preview pane on virtual / network filesystems
-        // where only a stream (no path) is available.
-        //
-        // We parse the header and — if image rendering is enabled — pre-buffer
-        // only the stride-sampled pixel rows into a MemoryStream. Then we
-        // release the COM IStream immediately, before this method returns.
-        // The Shell is never blocked waiting for us to release the file.
         void IInitializeWithStream.Initialize(object pstream, uint grfMode)
         {
-            Log($"IInitializeWithStream — grfMode={grfMode}");
-            _metadata  = null;
-            _comStream = null; 
-
-            if (pstream is System.Runtime.InteropServices.ComTypes.IStream comStream)
+            Log($"IInitializeWithStream.BEGIN — grfMode={grfMode} pstream={pstream?.GetHashCode():X8}");
+            try
             {
-                try
+                // We must hold the stream IF we are in a process that will call DoPreview (prevhost.exe)
+                bool isPreviewHost = System.Diagnostics.Process.GetCurrentProcess().ProcessName.ToLowerInvariant().Contains("prevhost");
+                
+                if (pstream is System.Runtime.InteropServices.ComTypes.IStream com)
                 {
-                    // 1. Fast header-only parse (fast, no lock held yet).
-                    using (var wrapper = new ComStreamWrapper(comStream, leaveOpen: true))
+                    _comStream = pstream;
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    using (var wrapper = new BufferedStream(new ComStreamWrapper(com, leaveOpen: true), 32 * 1024))
                     {
-                        wrapper.Seek(0, SeekOrigin.Begin);
                         var (rows, info) = FitsPreviewControl.ParseFitsStream(wrapper);
                         _keywords = rows;
                         _metadata = info;
+                        sw.Stop();
                         
-                        // 2. Buffer only the header and stride-sampled pixels into a SampledStream.
-                        //    Then we release the COM stream immediately.
-                        int targetDim = Settings.ShowImage ? 600 : -1;
-                        var ss = new SampledStream(info.Width, info.Height, info.BitPix, info.DataOffset);
+                        // DETECTION: If parsing 3KB of header took > 200ms, we are on a slow network/cloud link.
+                        // We will skip heavy thumbnail generation to keep Explorer responsive.
+                        _isSlowLink = sw.ElapsedMilliseconds > 200;
                         
-                        // Buffer header
-                        wrapper.Seek(0, SeekOrigin.Begin);
-                        byte[] hbuf = new byte[info.DataOffset > 0 ? info.DataOffset : 2880];
-                        wrapper.Read(hbuf, 0, hbuf.Length);
-                        ss.WriteSample(0, hbuf);
-
-                        if (targetDim > 0 && info.HasImage)
-                        {
-                            // Stride logic duplicated from RenderImage for pre-buffering
-                            double aspect = (double)info.Width / info.Height;
-                            int outW = info.Width >= info.Height ? Math.Min(info.Width, targetDim) : Math.Max(1, (int)(Math.Min(info.Height, targetDim) * aspect));
-                            int outH = info.Width >= info.Height ? Math.Max(1, (int)(outW / aspect)) : Math.Min(info.Height, targetDim);
-                            bool isBayer = !string.IsNullOrEmpty(info.BayerPattern) && info.Planes == 1;
-                            int sy = Math.Max(1, info.Height / outH);
-                            if (isBayer) sy = (sy / 2) * 2; // Force even stride to keep Bayer pairs together
-                            if (sy < 1) sy = 1;
-
-                            int bpp = info.BytesPerPixel;
-                            long rowBytes = (long)info.Width * bpp;
-
-                            byte[] row = new byte[rowBytes];
-                            for (int p = 0; p < info.Planes; p++)
-                            {
-                                long planeOff = info.DataOffset + (long)p * info.Height * rowBytes;
-                                for (int y = 0; y <= info.Height - (isBayer ? 2 : 1); y += sy)
-                                {
-                                    wrapper.Seek(planeOff + (long)y * rowBytes, SeekOrigin.Begin);
-                                    wrapper.Read(row, 0, (int)rowBytes);
-                                    ss.WriteSample(planeOff + (long)y * rowBytes, row);
-                                    if (isBayer) {
-                                        wrapper.Read(row, 0, (int)rowBytes);
-                                        ss.WriteSample(planeOff + (long)(y+1) * rowBytes, row);
-                                    }
-                                }
-                            }
-                        }
-                        ss.Position = 0;
-                        _comStream = ss; // Store our in-memory SampledStream instead of COM object
-                        Log($"  SampledStream buffered: {ss.BufferedBytes / 1024} KB. Header + {ss.SampleCount} rows.");
+                        Log($"  Header parsed OK: {info.Width}x{info.Height} (Lat={sw.ElapsedMilliseconds}ms, Slow={_isSlowLink})");
                     }
-                    // Release the COM IStream now so Shell can unlock the file
-                    Marshal.ReleaseComObject(pstream);
-                    Log("  COM IStream released.");
-                }
-                catch (Exception ex) { Log($"IInitializeWithStream EXCEPTION: {ex}"); }
-            }
-        }
 
+                    // CRITICAL: We used to release the stream here for non-preview host usages (properties/thumbnails).
+                    // BUT this broke thumbnails because GetThumbnail() needs that stream!
+                    // Instead, we now rely on RenderThumbnail() or the destructor to release it.
+                }
+            }
+            catch (Exception ex) { Log("IInitializeWithStream ERROR: " + ex); }
+            finally { Log("IInitializeWithStream.END"); }
+        }
 
         // ── IInitializeWithItem ─────────────────────────────────────────
         void IInitializeWithItem.Initialize(object psiObj, uint grfMode)
@@ -301,18 +281,12 @@ namespace FitsPreviewHandler
             catch (Exception ex) { Log("IInitializeWithItem EXCEPTION: " + ex); }
         }
 
-        // Not used anymore as we now stream directly from IStream/FileStream
-        // to avoid memory pressure and delay.
-
         // ── GetMetadata ─────────────────────────────────────────────────
-        // Pure cache read. No I/O. Safe from any thread at any time.
         private ImageInfo? GetMetadata()
         {
             if (_metadata.HasValue) return _metadata;
-            // Emergency fallback (should not be needed in normal operation).
             if (!string.IsNullOrEmpty(_filePath))
             {
-                Log("GetMetadata — cache miss, emergency fallback");
                 _metadata = ParseHeaderFromFile(_filePath);
             }
             return _metadata;
@@ -348,45 +322,39 @@ namespace FitsPreviewHandler
         [DllImport("user32.dll", SetLastError = true)] static extern int SetWindowLong(IntPtr h, int n, int v);
         const int GWL_STYLE = -16, WS_CHILD = 0x40000000, WS_VISIBLE = 0x10000000;
 
+        private void TryBeginInvoke(Control c, Action a) { try { if (!c.IsDisposed) c.BeginInvoke(a); } catch { } }
+
         public void DoPreview()
         {
-            Log($"DoPreview — path='{_filePath}' hwnd=0x{_parentHwnd:X}");
+            Log($"DoPreview.BEGIN — path='{_filePath}' hwnd=0x{_parentHwnd:X}");
             try
             {
-                if (_uiThread != null && _uiThread.IsAlive) { Log("DoPreview — already running"); return; }
+                if (_uiThread != null && _uiThread.IsAlive) { Log("  Already running, aborting NEW thread"); return; }
 
                 if (_bounds.right - _bounds.left <= 0 || _bounds.bottom - _bounds.top <= 0)
+                {
+                    Log("  Bounds empty, querying parent...");
                     if (GetClientRect(_parentHwnd, out RECT pr)) _bounds = pr;
+                }
 
                 Rectangle bounds = new Rectangle(_bounds.left, _bounds.top,
                     _bounds.right - _bounds.left, _bounds.bottom - _bounds.top);
+                Log($"  Final target bounds: {bounds}");
 
                 Stream renderStream = null;
-                if (_comStream is Stream s)
-                {
-                    renderStream = s;
-                    _comStream = null;
-                }
-                else if (_comStream is System.Runtime.InteropServices.ComTypes.IStream comStream)
-                {
-                    renderStream = new ComStreamWrapper(comStream);
-                    _comStream = null; // transfer ownership to wrapper
-                }
-
-                if (renderStream == null && !string.IsNullOrEmpty(_filePath))
+                if (!string.IsNullOrEmpty(_filePath))
                 {
                     try
                     {
                         renderStream = new FileStream(_filePath, FileMode.Open, FileAccess.Read,
                                                       FileShare.ReadWrite | FileShare.Delete);
-                        Log("DoPreview — FileStream opened for render");
+                        Log("  FileStream opened for render");
                     }
-                    catch (Exception ex) { Log($"DoPreview — FileStream failed: {ex.Message}"); }
+                    catch (Exception ex) { Log($"  FileStream failed: {ex.Message}"); }
                 }
 
                 string   fileName   = !string.IsNullOrEmpty(_filePath)
                     ? System.IO.Path.GetFileName(_filePath) : "FITS Stream";
-                Stream   localStream  = renderStream;
                 IntPtr   parentHost  = _parentHwnd;
                 var      ready       = new System.Threading.ManualResetEventSlim(false);
 
@@ -412,81 +380,70 @@ namespace FitsPreviewHandler
                         SetWindowPos(hwnd, IntPtr.Zero, bounds.X, bounds.Y,
                                      bounds.Width, bounds.Height, 0x0020 | 0x0040);
                         ctrl.Show();
-                        ctrl.Update(); // Force initial paint of empty container
+                        ctrl.Update();
 
-                        if (localStream != null && !ctrl.IsDisposed)
+                        if (renderStream != null)
                         {
-                            // We use BeginInvoke to ensure the Application.Run message loop is 
-                            // already active. This allows the grid to be populated and painted
-                            // BEFORE the background image task starts saturating the IO.
-                            ctrl.BeginInvoke(new Action(() => {
-                                ctrl.LoadFits(localStream, fileName, ownsStream: true, preParsedKeywords: _keywords, preParsedInfo: _metadata);
-                            }));
+                            ctrl.LoadFits(renderStream, fileName, ownsStream: true, preParsedKeywords: _keywords, preParsedInfo: _metadata);
+                        }
+                        else if (_comStream is System.Runtime.InteropServices.ComTypes.IStream comStream)
+                        {
+                            var s = new BufferedStream(new ComStreamWrapper(comStream, leaveOpen: true), 32 * 1024);
+                            ctrl.LoadFits(s, fileName, ownsStream: true, preParsedKeywords: _keywords, preParsedInfo: _metadata);
                         }
                         else if (!ctrl.IsDisposed)
                         {
-                            Log("UI Thread — no render stream (metadata-only or ShowImage=false)");
+                            Log("UI Thread — WARNING: no render stream");
                         }
 
+                        Log("UI Thread — entering Application.Run");
                         Application.Run(new ApplicationContext());
-                        Log("UI Thread — pump exited");
+                        Log("UI Thread — Application.Run returned");
                     }
                     catch (Exception ex)
                     {
                         Log("UI Thread EXCEPTION: " + ex);
-                        // Dispose stream if LoadFits never got to take ownership.
-                        try { localStream?.Dispose(); } catch { }
+                        try { renderStream?.Dispose(); } catch { }
                         ready.Set();
                     }
                 });
                 _uiThread.IsBackground = true;
                 _uiThread.SetApartmentState(System.Threading.ApartmentState.STA);
                 _uiThread.Start();
-                Log($"DoPreview — signalled={ready.Wait(3000)}");
+                bool ok = ready.Wait(3000);
+                Log($"DoPreview.END — signalled={ok}");
             }
             catch (Exception ex) { Log("DoPreview EXCEPTION: " + ex); }
         }
 
         public void Unload()
         {
-            Log("Unload — called");
-            var th = _uiThread;
-            _uiThread = null;
-
-            if (_control != null && _control.IsHandleCreated)
+            Log("Unload.BEGIN");
+            try
             {
-                var ctrl = _control;
-                _control = null;
-                var done = new System.Threading.ManualResetEventSlim(false);
-                try
+                if (_control != null)
                 {
-                    ctrl.BeginInvoke(new Action(() =>
+                    var ctrl = _control;
+                    _control = null;
+
+                    TryBeginInvoke(ctrl, () =>
                     {
-                        try   { ctrl.Dispose(); }
-                        catch (Exception ex) { Log("Unload dispose EXCEPTION: " + ex); }
-                        finally { try { Application.ExitThread(); } catch { } done.Set(); }
-                    }));
+                        try { ctrl.Dispose(); }
+                        catch (Exception ex) { Log("  Unload dispose EXCEPTION: " + ex); }
+                        finally { try { Application.ExitThread(); } catch { } }
+                    });
                 }
-                catch { done.Set(); }
-                done.Wait(3000);
+                
+                ReleaseStream();
             }
-
-            if (th != null && th.IsAlive) th.Join(2000);
-
-            if (_comStream != null)
-            {
-                try { Marshal.ReleaseComObject(_comStream); } catch { }
-                _comStream = null;
-                Log("Unload — COM stream released");
-            }
-
-            Log("Unload — done");
+            catch (Exception ex) { Log("Unload EXCEPTION: " + ex); }
+            finally { Log("Unload.END"); }
         }
 
         public void SetFocus()
         {
             if (_control != null && _control.IsHandleCreated)
-                _control.BeginInvoke(new Action(() => _control.Focus()));
+                TryBeginInvoke(_control, () => _control.Focus());
         }
 
         public void QueryFocus(out IntPtr phwnd) =>
@@ -499,28 +456,26 @@ namespace FitsPreviewHandler
         public void GetSite(ref Guid riid, out object ppvSite) { ppvSite = _site; }
 
         // ── IThumbnailProvider ──────────────────────────────────────────
-        // Always uses its own short-lived stream. Never touches _renderStream.
         public void GetThumbnail(uint cx, out IntPtr hbmp, out WTS_ALPHATYPE pdwAlpha)
         {
             hbmp     = IntPtr.Zero;
             pdwAlpha = WTS_ALPHATYPE.WTSAT_RGB;
-            Log($"GetThumbnail — cx={cx}");
+            Log($"GetThumbnail.BEGIN — cx={cx}");
             
-            System.Drawing.Bitmap bmp = null;
+            Bitmap bmp = null;
             try
             {
                 var metaP = GetMetadata();
-                if (!metaP.HasValue) { Log("GetThumbnail — no metadata"); return; }
+                if (!metaP.HasValue) { Log("  No metadata available for thumbnail"); return; }
+                
                 var info = metaP.Value;
                 int size = (int)Math.Max(cx, 32);
 
-                bool tryImage = Settings.ShowImage && info.HasImage;
-                
-                if (tryImage)
+                // PERFORMANCE: If we detected a slow link during Initialize, skip the image and show badge immediately.
+                if (Settings.ShowImage && info.HasImage && !_isSlowLink)
                 {
                     Stream stream = null;
                     bool owns = false;
-
                     try
                     {
                         if (!string.IsNullOrEmpty(_filePath))
@@ -529,50 +484,61 @@ namespace FitsPreviewHandler
                                                    FileShare.ReadWrite | FileShare.Delete);
                             owns = true;
                         }
-                        else if (_comStream is SampledStream s)
-                        {
-                            stream = s;
-                            // SampledStream implements Seek/Position, and we created it, 
-                            // so we can read from it directly.
-                        }
                         else if (_comStream is System.Runtime.InteropServices.ComTypes.IStream com)
                         {
-                            // Fallback for raw COM streams
-                            stream = new ComStreamWrapper(com, leaveOpen: true);
+                            stream = new BufferedStream(new ComStreamWrapper(com, leaveOpen: true), 32 * 1024);
                             owns = true;
                         }
 
                         if (stream != null)
                         {
-                            bmp = FitsPreviewControl.RenderThumbnail(stream, info, size);
-                            if (bmp != null) Log("GetThumbnail — Image rendered successfully");
+                            Log($"  Rendering thumbnail {size}x{size} (1.5s timeout)...");
+                            
+                            // Watchdog: If network is too slow, bail to avoid locking Explorer
+                            var renderTask = Task.Run(() => FitsPreviewControl.RenderThumbnail(stream, info, size, ownsStream: true));
+                            
+                            if (renderTask.Wait(1500)) 
+                            {
+                                bmp = renderTask.Result;
+                                _comStream = null; // Stream already released by the render call
+                            }
+                            else 
+                            {
+                                Log("  Thumbnail TIMEOUT - Aborting I/O to release file handle");
+                                // Forcing disposal here to break any pending network I/O
+                                if (owns && stream != null) try { stream.Dispose(); } catch {}
+                                ReleaseStream();
+                            }
+                            Log($"  Thumbnail result: {(bmp == null ? "FAILED/TIMEOUT" : "OK")}");
                         }
                     }
-                    catch (Exception ex) { Log($"GetThumbnail Image Render failed: {ex.Message}"); }
-                    finally { if (owns && stream != null) stream.Dispose(); }
+                    catch (Exception ex) { Log($"  Thumbnail stream render ERROR: {ex.Message}"); }
+                    finally { 
+                        if (owns && stream != null) try { stream.Dispose(); } catch {}
+                        if (_comStream != null) ReleaseStream(); 
+                    }
                 }
 
-                // Fallback to badge if image failed or is disabled
                 if (bmp == null)
                 {
-                    Log("GetThumbnail — Rendering static badge");
+                    Log("  Using static badge for thumbnail");
                     bmp = FitsPreviewControl.RenderStaticBadge(info, size);
                 }
 
                 if (bmp != null)
                 {
-                    hbmp = bmp.GetHbitmap(System.Drawing.Color.Black);
-                    // Standard thumbnails are non-alpha for shell efficiency
-                    pdwAlpha = WTS_ALPHATYPE.WTSAT_RGB;
+                    hbmp = bmp.GetHbitmap(Color.Black);
                 }
             }
-            catch (Exception ex) { Log("GetThumbnail — FATAL EXCEPTION: " + ex); }
-            finally { if (bmp != null) bmp.Dispose(); }
+            catch (Exception ex) { Log("GetThumbnail EXCEPTION: " + ex); }
+            finally 
+            { 
+                if (bmp != null) try { bmp.Dispose(); } catch {} 
+                Log("GetThumbnail.END");
+            }
         }
 
         // ── IPropertyStore ──────────────────────────────────────────────
-        // Zero I/O after Initialize. Reads only from _metadata.
-
         public uint GetCount(out uint cProps) { cProps = 7; return 0; }
 
         public uint GetAt(uint iProp, out PropertyKey pkey)
@@ -592,9 +558,9 @@ namespace FitsPreviewHandler
         {
             pv = new PropVariant();
             var metaP = GetMetadata();
-            if (!metaP.HasValue) return 0x80004005; // E_FAIL
-            var meta = metaP.Value;
+            if (!metaP.HasValue) return 0x80004005;
 
+            var meta = metaP.Value;
             if      (key.Equals(PKEYs.Subject))           pv.SetString(meta.Object ?? "");
             else if (key.Equals(PKEYs.Photo_CameraModel)) pv.SetString(meta.Instrument ?? meta.Camera ?? "");
             else if (key.Equals(PKEYs.Image_Width))       pv.SetInt(meta.Width);
@@ -603,15 +569,10 @@ namespace FitsPreviewHandler
             else if (key.Equals(PKEYs.Photo_Exposure))    pv.SetDouble(meta.Exposure);
             else if (key.Equals(PKEYs.Category))
             {
-                string t   = (meta.ImageType ?? "").ToLowerInvariant();
-                string cat = t.Contains("light") ? "Light"
-                           : t.Contains("flat")  ? "Flat"
-                           : t.Contains("dark")  ? "Dark"
-                           : t.Contains("bias")  ? "Bias"
-                           : meta.ImageType ?? "";
-                pv.SetString(cat);
+                string t = (meta.ImageType ?? "").ToLowerInvariant();
+                pv.SetString(t.Contains("light") ? "Light" : t.Contains("flat") ? "Flat" : t.Contains("dark") ? "Dark" : t.Contains("bias") ? "Bias" : meta.ImageType ?? "");
             }
-            return 0; // S_OK
+            return 0;
         }
 
         public uint SetValue(ref PropertyKey key, ref PropVariant pv) => 0x80030001;
@@ -626,14 +587,13 @@ namespace FitsPreviewHandler
             {
                 string guid  = t.GUID.ToString("B").ToUpper();
                 string appid = "{6d2b5079-2f0b-48dd-ab7f-97cec514d30b}";
-                Log($"--- Register {guid} ---", true);
+                LogStatic($"--- Register {guid} ---");
 
                 using (RegistryKey key = Registry.LocalMachine.CreateSubKey(Settings.REG_PATH))
                     if (key != null)
                     {
                         if (key.GetValue(Settings.VAL_SHOW_IMAGE)   == null) key.SetValue(Settings.VAL_SHOW_IMAGE,    1,  RegistryValueKind.DWord);
                         if (key.GetValue(Settings.VAL_ENABLE_LOG)   == null) key.SetValue(Settings.VAL_ENABLE_LOG,    0,  RegistryValueKind.DWord);
-                        if (key.GetValue(Settings.VAL_SPLITTER_POS) == null) key.SetValue(Settings.VAL_SPLITTER_POS, -1,  RegistryValueKind.DWord);
                     }
 
                 using (RegistryKey key = Registry.ClassesRoot.CreateSubKey(".fits"))
@@ -665,12 +625,10 @@ namespace FitsPreviewHandler
                 using (RegistryKey key = Registry.ClassesRoot.CreateSubKey("CLSID\\" + guid))
                 {
                     key.SetValue("AppID", appid);
-                    key.DeleteValue("ManualSafeSave",          false);
-                    key.DeleteValue("DisableProcessIsolation", false);
                 }
-                Log("  Register OK", true);
+                LogStatic("  Register OK");
             }
-            catch (Exception ex) { Log("  Register ERROR: " + ex, true); throw; }
+            catch (Exception ex) { LogStatic("  Register ERROR: " + ex); throw; }
         }
 
         [ComUnregisterFunction]
@@ -679,7 +637,7 @@ namespace FitsPreviewHandler
             try
             {
                 string guid = t.GUID.ToString("B").ToUpper();
-                Log($"--- Unregister {guid} ---", true);
+                LogStatic($"--- Unregister {guid} ---");
                 Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{8895b1c6-b41f-4c1c-a562-0d564250836f}", false);
                 Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}", false);
                 Registry.ClassesRoot.DeleteSubKeyTree(".fits\\ShellEx\\{e357fccd-a995-4576-b01f-234630154e96}", false);
@@ -688,9 +646,9 @@ namespace FitsPreviewHandler
                 Registry.LocalMachine.DeleteSubKeyTree("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PropertySystem\\PropertyHandlers\\.fits", false);
                 using (RegistryKey key = Registry.ClassesRoot.OpenSubKey("CLSID\\" + guid, true))
                     key?.DeleteValue("AppID", false);
-                Log("  Unregister OK", true);
+                LogStatic("  Unregister OK");
             }
-            catch (Exception ex) { Log("  Unregister ERROR: " + ex, true); }
+            catch (Exception ex) { LogStatic("  Unregister ERROR: " + ex); }
         }
 
         #endregion

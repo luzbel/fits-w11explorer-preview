@@ -13,7 +13,9 @@
 ## ✨ Main Features
 
 - **Responsive Architecture**: Reads multi-GB FITS files instantly without copying to disk.
-- **Near-Zero Lock Design**: Releases file handles in milliseconds after an initial sampling phase. You can rename or move folders even while the preview is active.
+- **Cloud-Optimized I/O**: Uses a high-throughput **Block Reading (32MB)** strategy to minimize network round-trips for high-latency storage (pCloud, OneDrive, NAS).
+- **Near-Zero Lock Design**: Releases file handles in milliseconds after initial reading. You can rename or move folders even while the high-resolution render is being computed in RAM.
+- **Zero-Latency Navigation**: Asynchronous unloading ensures **0ms delay** when scrolling through hundreds of files using the arrow keys.
 - **Metadata-First Display**: The FITS header table appears instantly, while the image loads in the background with progress feedback.
 - **Thumbnail Provider**: Generates native Windows Explorer thumbnails for `.fits` files:
   - **Stride Sampling**: Only reads the fraction of pixels needed for the icon size.
@@ -21,7 +23,9 @@
   - **Static Badge mode**: If `ShowImage=0`, thumbnails show a colour-coded card:
     - **Background**: Encodes frame type (`LIGHT`=Dark Blue, `FLAT`=Light Grey, `DARK`=Dark Red, `BIAS`=Dark Grey).
     - **Top Stripe**: Encodes the filter (e.g., Red for Ha, Cyan for OIII, etc.).
-    - **Labels**: High-contrast text identifying the frame type and format ("FITS").
+  - **Smart Latency Detection**: Measures storage response time. If latency is >200ms (Cloud non-hydrated), it instantly falls back to a **Badge** to prevent Explorer from hanging.
+  - **Automatic Upgrade**: Selecting a file in the Preview Pane triggers an automatic refresh for its thumbnail, upgrading "Badges" to "Photos" once the file is cached locally.
+  - **Labels**: High-contrast text identifying the frame type and format ("FITS").
 - **Windows Property System Integration**: Extracts metadata from FITS headers and injects them natively into Windows Explorer.
   - **Mapped Properties**:
     - `System.Subject` (from FITS `OBJECT`)

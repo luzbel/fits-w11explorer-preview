@@ -16,6 +16,10 @@ namespace FitsPreviewHandler
         private bool _disposed;
         private bool _leaveOpen;
 
+        // Reuse pointers to avoid thousands of Alloc/Free calls during rendering
+        private readonly IntPtr _readPtr = Marshal.AllocCoTaskMem(sizeof(int));
+        private readonly IntPtr _seekPtr = Marshal.AllocCoTaskMem(sizeof(long));
+
         public ComStreamWrapper(IStream source, bool leaveOpen = false)
         {
             _source = source ?? throw new ArgumentNullException(nameof(source));
@@ -31,7 +35,8 @@ namespace FitsPreviewHandler
             get
             {
                 if (_disposed) throw new ObjectDisposedException(nameof(ComStreamWrapper));
-                _source.Stat(out System.Runtime.InteropServices.ComTypes.STATSTG stat, 1); // STATFLAG_NONAME = 1
+                System.Runtime.InteropServices.ComTypes.STATSTG stat;
+                _source.Stat(out stat, 1); // STATFLAG_NONAME = 1
                 return stat.cbSize;
             }
         }
@@ -49,31 +54,16 @@ namespace FitsPreviewHandler
             if (_disposed) throw new ObjectDisposedException(nameof(ComStreamWrapper));
             if (offset != 0) throw new NotSupportedException("Only 0 offset supported for ComStream bridge");
 
-            IntPtr bytesReadPtr = Marshal.AllocCoTaskMem(sizeof(int));
-            try
-            {
-                _source.Read(buffer, count, bytesReadPtr);
-                return Marshal.ReadInt32(bytesReadPtr);
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(bytesReadPtr);
-            }
+            // Native call to explorer.exe (or whoever owns the stream)
+            _source.Read(buffer, count, _readPtr);
+            return Marshal.ReadInt32(_readPtr);
         }
 
         public override long Seek(long offset, SeekOrigin origin)
         {
             if (_disposed) throw new ObjectDisposedException(nameof(ComStreamWrapper));
-            IntPtr posPtr = Marshal.AllocCoTaskMem(sizeof(long));
-            try
-            {
-                _source.Seek(offset, (int)origin, posPtr);
-                return Marshal.ReadInt64(posPtr);
-            }
-            finally
-            {
-                Marshal.FreeCoTaskMem(posPtr);
-            }
+            _source.Seek(offset, (int)origin, _seekPtr);
+            return Marshal.ReadInt64(_seekPtr); 
         }
 
         public override void SetLength(long value)  => throw new NotSupportedException();
@@ -86,14 +76,15 @@ namespace FitsPreviewHandler
                 _disposed = true;
                 if (_source != null)
                 {
-                    // Release our COM reference so the shell's IStream ref-count can reach
-                    // zero and the underlying Win32 file handle can be closed immediately.
                     if (!_leaveOpen)
                     {
                         try { Marshal.ReleaseComObject(_source); } catch { }
                     }
                     _source = null;
                 }
+                // Memory cleanup
+                Marshal.FreeCoTaskMem(_readPtr);
+                Marshal.FreeCoTaskMem(_seekPtr);
             }
             base.Dispose(disposing);
         }
